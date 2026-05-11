@@ -1,0 +1,290 @@
+# =============================================================================
+# TEMPLATE 5: ML Platform — SageMaker Training + Endpoint
+# Stack Name: ad-scorer-ml
+# Deploy FIFTH — depends on Foundation stack (S3, IAM, KMS).
+# NOTE: Trigger training job manually after uploading training data to S3.
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SageMaker resources for the Ad Creative Scorer.
+  Provisions: Training Job definition, Model, Endpoint Config, and real-time Endpoint.
+  Uses built-in XGBoost container for CTR prediction.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ad-scorer
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  SageMakerXGBoostVersion:
+    Type: String
+    Default: "1.7-1"
+    Description: XGBoost container image version tag
+
+  TrainingInstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+    Description: EC2 instance type for training job
+    AllowedValues:
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.m5.4xlarge
+      - ml.c5.xlarge
+      - ml.c5.2xlarge
+      - ml.p3.2xlarge  # GPU — for neural net variant
+
+  InferenceInstanceType:
+    Type: String
+    Default: ml.t3.medium
+    Description: EC2 instance type for real-time inference endpoint
+    AllowedValues:
+      - ml.t3.medium
+      - ml.t3.large
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.c5.large
+
+  ModelS3Key:
+    Type: String
+    Default: "models/xgboost-ctr/model.tar.gz"
+    Description: S3 key of the trained model artifact within the ML Artifacts bucket
+
+  # Hyperparameters for XGBoost training
+  HPMaxDepth:
+    Type: Number
+    Default: 6
+  HPEta:
+    Type: Number
+    Default: 0.1
+  HPNumRound:
+    Type: Number
+    Default: 100
+  HPSubsample:
+    Type: Number
+    Default: 0.8
+  HPObjective:
+    Type: String
+    Default: "binary:logistic"
+    Description: >
+      XGBoost objective function.
+      binary:logistic → CTR binary prediction (clicked / not clicked).
+      reg:squarederror → engagement score regression.
+
+Resources:
+
+  # ── SageMaker Training Job ─────────────────────────────────────────────────
+  # This resource STARTS a training job when the stack is created.
+  # Re-training = update stack with new training data S3 prefix.
+  AdScorerTrainingJob:
+    Type: AWS::SageMaker::TrainingJob
+    Properties:
+      TrainingJobName: !Sub "${ProjectName}-xgboost-training-${Environment}"
+      RoleArn: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-SageMakerRoleArn"
+      AlgorithmSpecification:
+        TrainingImage: !Sub "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-xgboost:${SageMakerXGBoostVersion}"
+        TrainingInputMode: File
+        EnableSageMakerMetricsTimeSeries: true
+        MetricDefinitions:
+          - Name: validation:auc
+            Regex: "\\[\\d+\\] validation-auc:([0-9\\.]+)"
+          - Name: train:auc
+            Regex: "\\[\\d+\\] train-auc:([0-9\\.]+)"
+          - Name: validation:error
+            Regex: "\\[\\d+\\] validation-error:([0-9\\.]+)"
+      HyperParameters:
+        max_depth: !Sub "${HPMaxDepth}"
+        eta: !Sub "${HPEta}"
+        num_round: !Sub "${HPNumRound}"
+        subsample: !Sub "${HPSubsample}"
+        objective: !Ref HPObjective
+        eval_metric: auc
+        # Feature columns (must match feature_vector order in InferenceLambda)
+        # face_present, face_count, emotion_confidence, word_count,
+        # label_count, moderation_flag_count, color_saturation
+      InputDataConfig:
+        # Training data: CSV with header row stripped
+        # Format: label,face_present,face_count,emotion_confidence,word_count,...
+        - ChannelName: train
+          DataSource:
+            S3DataSource:
+              S3DataType: S3Prefix
+              S3Uri: !Sub
+                - "s3://${Bucket}/training-data/train/"
+                - Bucket: !ImportValue
+                    Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+              S3DataDistributionType: FullyReplicated
+          ContentType: text/csv
+          CompressionType: None
+        - ChannelName: validation
+          DataSource:
+            S3DataSource:
+              S3DataType: S3Prefix
+              S3Uri: !Sub
+                - "s3://${Bucket}/training-data/validation/"
+                - Bucket: !ImportValue
+                    Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+              S3DataDistributionType: FullyReplicated
+          ContentType: text/csv
+      OutputDataConfig:
+        S3OutputPath: !Sub
+          - "s3://${Bucket}/models/xgboost-ctr/"
+          - Bucket: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+        KmsKeyId: !ImportValue
+          Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      ResourceConfig:
+        InstanceType: !Ref TrainingInstanceType
+        InstanceCount: 1
+        VolumeSizeInGB: 20
+        VolumeKmsKeyId: !ImportValue
+          Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      StoppingCondition:
+        MaxRuntimeInSeconds: 3600    # 1 hour max training time
+        MaxWaitTimeInSeconds: 7200   # with spot: wait up to 2 hours total
+      EnableManagedSpotTraining: true   # ~70% cost savings in dev/staging
+      CheckpointConfig:
+        S3Uri: !Sub
+          - "s3://${Bucket}/checkpoints/xgboost-ctr/"
+          - Bucket: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+      EnableInterContainerTrafficEncryption: true
+      EnableNetworkIsolation: false  # Allow Rekognition feature download during training
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SageMaker Model ────────────────────────────────────────────────────────
+  # NOTE: ModelS3Key must point to completed training output.
+  # After training job completes, update ModelS3Key parameter to:
+  #   models/xgboost-ctr/<training-job-name>/output/model.tar.gz
+  AdScorerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub "${ProjectName}-xgboost-${Environment}"
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-SageMakerRoleArn"
+      PrimaryContainer:
+        Image: !Sub "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-xgboost:${SageMakerXGBoostVersion}"
+        ModelDataUrl: !Sub
+          - "s3://${Bucket}/${ModelKey}"
+          - Bucket: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+            ModelKey: !Ref ModelS3Key
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/model
+      EnableNetworkIsolation: true  # Isolate inference container
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── SageMaker Endpoint Configuration ───────────────────────────────────────
+  AdScorerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub "${ProjectName}-scoring-config-${Environment}"
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      ProductionVariants:
+        - VariantName: Primary
+          ModelName: !GetAtt AdScorerModel.ModelName
+          InstanceType: !Ref InferenceInstanceType
+          InitialInstanceCount: 1
+          InitialVariantWeight: 1.0
+      # Async inference config (optional for large video assets)
+      # AsyncInferenceConfig:
+      #   OutputConfig:
+      #     S3OutputPath: !Sub "s3://${MLArtifactsBucket}/async-inference-output/"
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: 20   # Capture 20% of requests for monitoring
+        DestinationS3Uri: !Sub
+          - "s3://${Bucket}/data-capture/"
+          - Bucket: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+        KmsKeyId: !ImportValue
+          Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+        CaptureContentTypeHeader:
+          CsvContentTypes:
+            - text/csv
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── SageMaker Real-Time Endpoint ────────────────────────────────────────────
+  AdScorerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub "${ProjectName}-scoring-endpoint-${Environment}"
+      EndpointConfigName: !GetAtt AdScorerEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Application Auto Scaling for Endpoint ──────────────────────────────────
+  # Scale between 1 and 10 instances based on InvocationsPerInstance metric.
+  EndpointScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: AdScorerEndpoint
+    Properties:
+      MinCapacity: 1
+      MaxCapacity: 10
+      ResourceId: !Sub "endpoint/${ProjectName}-scoring-endpoint-${Environment}/variant/Primary"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/sagemaker.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_SageMakerEndpoint"
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ServiceNamespace: sagemaker
+
+  EndpointScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-endpoint-scaling-${Environment}"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EndpointScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: SageMakerVariantInvocationsPerInstance
+        TargetValue: 70.0      # Scale out when >70 invocations/instance/minute
+        ScaleInCooldown: 300   # 5 min cool-down before scaling in
+        ScaleOutCooldown: 60   # 1 min cool-down before scaling out
+
+  # ── SSM Parameter: endpoint name for Lambda reference ─────────────────────
+  SSMEndpointName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/sagemaker/endpoint-name"
+      Type: String
+      Value: !Sub "${ProjectName}-scoring-endpoint-${Environment}"
+      Description: SageMaker scoring endpoint name
+
+Outputs:
+  TrainingJobName:
+    Description: SageMaker training job name
+    Value: !Sub "${ProjectName}-xgboost-training-${Environment}"
+
+  ModelName:
+    Description: SageMaker model name
+    Value: !GetAtt AdScorerModel.ModelName
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ModelName"
+
+  EndpointName:
+    Description: SageMaker real-time endpoint name
+    Value: !Sub "${ProjectName}-scoring-endpoint-${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-EndpointName"
+
+  EndpointArn:
+    Description: SageMaker endpoint ARN
+    Value: !Ref AdScorerEndpoint
