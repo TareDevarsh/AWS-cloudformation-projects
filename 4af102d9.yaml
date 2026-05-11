@@ -1,0 +1,242 @@
+# =============================================================================
+# TEMPLATE 4: Orchestration — AWS Step Functions State Machine
+# Stack Name: ad-scorer-orchestration
+# Deploy FOURTH — depends on Compute stack Lambda ARNs.
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Step Functions Express Workflow for the Ad Creative Scorer ML pipeline.
+  Orchestrates: Validate → Feature Extraction → Inference → Store Results.
+  Uses EXPRESS type for high-throughput, low-latency scoring.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ad-scorer
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+
+  # ── CloudWatch Log Group for Step Functions ───────────────────────────────────
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${ProjectName}-pipeline-${Environment}"
+      RetentionInDays: 30
+
+  # ── Step Functions Express State Machine ──────────────────────────────────────
+  # Pipeline flow:
+  # 1. ValidateInput        — check required fields present
+  # 2. ExtractFeatures      — Lambda: Rekognition analysis
+  # 3. ScoringGate          — Choice: skip inference if moderation flags detected
+  # 4. RunInference         — Lambda: SageMaker endpoint call
+  # 5. StoreResult          — DynamoDB write (handled inside InferenceLambda)
+  # 6. NotifyComplete       — EventBridge event on success
+  # On error: UpdateStatusFailed — mark DynamoDB item as FAILED
+  AdScorerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-pipeline-${Environment}"
+      StateMachineType: EXPRESS   # <100ms latency; ideal for real-time scoring API
+      RoleArn: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-StepFunctionsRoleArn"
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      # Amazon States Language definition
+      Definition:
+        Comment: "Ad Creative Scoring Pipeline — Feature Extraction → Inference"
+        StartAt: ValidateInput
+
+        States:
+
+          # ── State 1: Validate required fields ─────────────────────────────────
+          ValidateInput:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !Sub "${ProjectName}-feature-extraction-${Environment}"
+              Payload:
+                action: VALIDATE
+                creative_id.$: "$.creative_id"
+                s3_bucket.$: "$.s3_bucket"
+                s3_key.$: "$.s3_key"
+                campaign_id.$: "$.campaign_id"
+                scored_at.$: "$.scored_at"
+            ResultPath: "$.validation"
+            Retry:
+              - ErrorEquals: ["Lambda.ServiceException", "Lambda.TooManyRequestsException"]
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: UpdateStatusFailed
+                ResultPath: "$.error"
+            Next: ExtractFeatures
+
+          # ── State 2: Feature extraction via Rekognition ────────────────────────
+          ExtractFeatures:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !ImportValue
+                Fn::Sub: "${ProjectName}-${Environment}-FeatureExtractionLambdaArn"
+              Payload.$: "$"
+            ResultSelector:
+              features.$: "$.Payload"
+            ResultPath: "$.extracted"
+            TimeoutSeconds: 300
+            HeartbeatSeconds: 60
+            Retry:
+              - ErrorEquals:
+                  - "Lambda.ServiceException"
+                  - "Lambda.AWSLambdaException"
+                  - "Lambda.TooManyRequestsException"
+                  - "Rekognition.ProvisionedThroughputExceededException"
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: UpdateStatusFailed
+                ResultPath: "$.error"
+            Next: ModerationGate
+
+          # ── State 3: Skip scoring if moderation flags detected ─────────────────
+          ModerationGate:
+            Type: Choice
+            Choices:
+              - Variable: "$.extracted.features.moderation_flags[0]"
+                IsPresent: true
+                Next: FlaggedForModeration
+            Default: RunInference
+            Comment: >
+              If Rekognition returns any moderation labels, bypass scoring
+              and route to a flagged state. Clean creatives proceed to inference.
+
+          # ── State 4a: Moderation flag path ────────────────────────────────────
+          FlaggedForModeration:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: !Sub "${ProjectName}-scores-${Environment}"
+              Key:
+                creativeId:
+                  S.$: "$.creative_id"
+                scoredAt:
+                  S.$: "$.scored_at"
+              UpdateExpression: "SET #status = :s, moderationFlags = :flags"
+              ExpressionAttributeNames:
+                "#status": "status"
+              ExpressionAttributeValues:
+                ":s":
+                  S: "FLAGGED"
+                ":flags":
+                  S.$: "States.JsonToString($.extracted.features.moderation_flags)"
+            ResultPath: null
+            Next: PublishScoringEvent
+
+          # ── State 4b: Run ML inference ─────────────────────────────────────────
+          RunInference:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !ImportValue
+                Fn::Sub: "${ProjectName}-${Environment}-InferenceLambdaArn"
+              Payload:
+                creative_id.$: "$.creative_id"
+                campaign_id.$: "$.campaign_id"
+                scored_at.$: "$.scored_at"
+                features.$: "$.extracted.features"
+            ResultSelector:
+              score.$: "$.Payload"
+            ResultPath: "$.inference"
+            TimeoutSeconds: 60
+            Retry:
+              - ErrorEquals:
+                  - "Lambda.ServiceException"
+                  - "SageMaker.ModelError"
+                IntervalSeconds: 3
+                MaxAttempts: 2
+                BackoffRate: 1.5
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: UpdateStatusFailed
+                ResultPath: "$.error"
+            Next: PublishScoringEvent
+
+          # ── State 5: Publish EventBridge event on completion ──────────────────
+          PublishScoringEvent:
+            Type: Task
+            Resource: arn:aws:states:::events:putEvents
+            Parameters:
+              Entries:
+                - EventBusName: default
+                  Source: !Sub "${ProjectName}.scorer"
+                  DetailType: CreativeScoringComplete
+                  Detail:
+                    creative_id.$: "$.creative_id"
+                    campaign_id.$: "$.campaign_id"
+                    status.$: "$.inference.score.status"
+                    ctr_score.$: "$.inference.score.ctr_score"
+            ResultPath: null
+            End: true
+
+          # ── Error State: Mark item as FAILED in DynamoDB ──────────────────────
+          UpdateStatusFailed:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: !Sub "${ProjectName}-scores-${Environment}"
+              Key:
+                creativeId:
+                  S.$: "$.creative_id"
+                scoredAt:
+                  S.$: "$.scored_at"
+              UpdateExpression: "SET #status = :s, errorDetails = :err"
+              ExpressionAttributeNames:
+                "#status": "status"
+              ExpressionAttributeValues:
+                ":s":
+                  S: "FAILED"
+                ":err":
+                  S.$: "States.JsonToString($.error)"
+            End: true
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SSM Parameter: Store state machine ARN for Lambda to look up ──────────────
+  SSMStateMachineArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/stepfunctions/state-machine-arn"
+      Type: String
+      Value: !Ref AdScorerStateMachine
+      Description: Step Functions state machine ARN
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Ad Scorer Step Functions state machine
+    Value: !Ref AdScorerStateMachine
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-StateMachineArn"
+
+  StateMachineName:
+    Description: Name of the state machine
+    Value: !Sub "${ProjectName}-pipeline-${Environment}"
