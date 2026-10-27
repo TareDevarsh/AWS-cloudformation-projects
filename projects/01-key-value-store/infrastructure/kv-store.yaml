@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  01-key-value-store - Serverless key-value store.
+  API Gateway (REST, IAM auth) -> Lambda (Python) -> DynamoDB (on-demand).
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Deployment stage, used in names and tags.
+
+Resources:
+  # ---------- Data ----------
+  KvTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete            # prototype; switch to Retain for real data
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - { Key: Project, Value: 01-key-value-store }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # ---------- Compute ----------
+  KvFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/kv-store-${Stage}
+      RetentionInDays: 14
+
+  KvFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: kv-table-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt KvTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt KvFunctionLogGroup.Arn
+      Tags:
+        - { Key: Project, Value: 01-key-value-store }
+        - { Key: Stage, Value: !Ref Stage }
+
+  KvFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: KvFunctionLogGroup
+    Properties:
+      FunctionName: !Sub kv-store-${Stage}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt KvFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref KvTable
+      Tags:
+        - { Key: Project, Value: 01-key-value-store }
+        - { Key: Stage, Value: !Ref Stage }
+      Code:
+        ZipFile: |
+          """Key-value store handler. Routes:
+          GET    /kv          list keys (max 100)
+          GET    /kv/{key}    read value
+          PUT    /kv/{key}    body {"value": <any JSON>, "ttlSeconds": <int, optional>}
+          DELETE /kv/{key}    delete key
+          """
+          import json, os, time
+          import boto3
+
+          TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          MAX_KEY_LEN = 256
+          MAX_VALUE_BYTES = 350_000  # DynamoDB item limit is 400 KB
+
+          def resp(code, body):
+              return {"statusCode": code,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body)}
+
+          def handler(event, context):
+              method = event.get("httpMethod")
+              key = (event.get("pathParameters") or {}).get("key")
+
+              if key is None:
+                  if method != "GET":
+                      return resp(405, {"error": "method not allowed"})
+                  items = TABLE.scan(Limit=100, ProjectionExpression="pk").get("Items", [])
+                  return resp(200, {"keys": [i["pk"] for i in items]})
+
+              if not key or len(key) > MAX_KEY_LEN:
+                  return resp(400, {"error": f"key must be 1-{MAX_KEY_LEN} chars"})
+
+              if method == "GET":
+                  item = TABLE.get_item(Key={"pk": key}).get("Item")
+                  if not item or ("expiresAt" in item and int(item["expiresAt"]) < time.time()):
+                      return resp(404, {"error": "not found"})
+                  return resp(200, {"key": key, "value": json.loads(item["value"]),
+                                    "updatedAt": int(item["updatedAt"])})
+
+              if method == "PUT":
+                  try:
+                      body = json.loads(event.get("body") or "{}")
+                  except json.JSONDecodeError:
+                      return resp(400, {"error": "body must be JSON"})
+                  if not isinstance(body, dict) or "value" not in body:
+                      return resp(400, {"error": "body must be {\"value\": ...}"})
+                  value = json.dumps(body["value"])
+                  if len(value.encode()) > MAX_VALUE_BYTES:
+                      return resp(413, {"error": "value too large"})
+                  now = int(time.time())
+                  item = {"pk": key, "value": value, "updatedAt": now}
+                  ttl = body.get("ttlSeconds")
+                  if ttl is not None:
+                      if not isinstance(ttl, int) or ttl <= 0:
+                          return resp(400, {"error": "ttlSeconds must be a positive integer"})
+                      item["expiresAt"] = now + ttl
+                  TABLE.put_item(Item=item)
+                  return resp(200, {"key": key, "updatedAt": now})
+
+              if method == "DELETE":
+                  old = TABLE.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD").get("Attributes")
+                  if not old:
+                      return resp(404, {"error": "not found"})
+                  return resp(200, {"deleted": key})
+
+              return resp(405, {"error": "method not allowed"})
+
+  # ---------- API ----------
+  KvApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub kv-store-${Stage}
+      Description: Key-value store API (IAM/SigV4 auth)
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - { Key: Project, Value: 01-key-value-store }
+        - { Key: Stage, Value: !Ref Stage }
+
+  KvResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref KvApi
+      ParentId: !GetAtt KvApi.RootResourceId
+      PathPart: kv
+
+  KvKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref KvApi
+      ParentId: !Ref KvResource
+      PathPart: "{key}"
+
+  ListKeysMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KvApi
+      ResourceId: !Ref KvResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  GetKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KvApi
+      ResourceId: !Ref KvKeyResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  PutKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KvApi
+      ResourceId: !Ref KvKeyResource
+      HttpMethod: PUT
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  DeleteKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref KvApi
+      ResourceId: !Ref KvKeyResource
+      HttpMethod: DELETE
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  KvApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ListKeysMethod, GetKeyMethod, PutKeyMethod, DeleteKeyMethod]
+    Properties:
+      RestApiId: !Ref KvApi
+
+  KvApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref KvApi
+      DeploymentId: !Ref KvApiDeployment
+      StageName: !Ref Stage
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      Tags:
+        - { Key: Project, Value: 01-key-value-store }
+        - { Key: Stage, Value: !Ref Stage }
+
+  KvFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KvFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${KvApi}/*/*/kv*
+
+  # ---------- Client access ----------
+  KvClientPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to a user/role that should call the KV API.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: execute-api:Invoke
+            Resource: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${KvApi}/${Stage}/*/kv*
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the KV API
+    Value: !Sub https://${KvApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  TableName:
+    Description: DynamoDB table backing the store
+    Value: !Ref KvTable
+  FunctionName:
+    Value: !Ref KvFunction
+  ClientPolicyArn:
+    Description: Attach this managed policy to callers to grant execute-api:Invoke
+    Value: !Ref KvClientPolicy

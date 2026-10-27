@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: NN-project-name - one-line description.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+Resources:
+  # Placeholder so the template is deployable; replace with real resources.
+  PlaceholderParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /NN-project-name/${Stage}/placeholder
+      Type: String
+      Value: replace-me
+      Tags:
+        Project: NN-project-name
+        Stage: !Ref Stage
+
+Outputs:
+  PlaceholderName:
+    Value: !Ref PlaceholderParam

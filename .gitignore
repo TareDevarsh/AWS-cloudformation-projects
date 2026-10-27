@@ -1,0 +1,22 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.zip
+packaged*.yaml
+.aws-sam/
+
+# Secrets / local config
+.env
+*.pem
+*.key
