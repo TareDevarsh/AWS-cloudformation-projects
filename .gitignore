@@ -20,3 +20,6 @@ packaged*.yaml
 .env
 *.pem
 *.key
+
+# Agent workflow scratch
+.agents/

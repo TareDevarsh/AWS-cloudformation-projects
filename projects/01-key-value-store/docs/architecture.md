@@ -1,6 +1,6 @@
 # Architecture · 01 Key-Value Store
 
-[← Project README](../README.md)
+[← Project README](../README.md) · [Architecture image](images/architecture.png)
 
 ## Components
 
@@ -61,7 +61,7 @@ DynamoDB TTL deletes expired items lazily (can take up to ~48 h), so the handler
 | Storage | DynamoDB | ElastiCache Redis, S3 | Serverless, no VPC, single-digit-ms reads, pay-per-request |
 | API | API Gateway REST | HTTP API, Lambda URL | REST API supports `AWS_IAM` per method + stage throttling |
 | Auth | IAM / SigV4 | Cognito, API keys | Callers are AWS principals; API keys are not authentication |
-| Code packaging | Inline `ZipFile` | S3 artifact / SAM | One-file deploy, no bucket needed; move to `src/` when it grows |
+| Code packaging | `src/` + `aws cloudformation package` | Inline `ZipFile`, SAM | Real files are testable and lintable; plain CFN keeps it tool-light |
 | List keys | `Scan` limit 100 | GSI, pagination | Fine for a prototype; documented as next step |
 | Billing | `PAY_PER_REQUEST` | Provisioned | Unpredictable/low traffic, zero idle cost |
 

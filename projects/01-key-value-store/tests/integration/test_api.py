@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end smoke test for the KV API using SigV4-signed requests.
 
-Usage: python3 scripts/test_kv.py [stage] [region]
+Usage: python3 tests/integration/test_api.py [stage] [region]
 Needs: boto3, credentials allowed to execute-api:Invoke (see ClientPolicyArn output).
 """
 import json

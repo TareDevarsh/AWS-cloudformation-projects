@@ -1,25 +1,54 @@
 #!/usr/bin/env bash
-# Deploy the KV store stack. Usage: ./scripts/deploy.sh [stage] [region]
+# Package src/ and deploy the KV store stack.
+# Usage: ./scripts/deploy.sh [stage] [region]
 set -euo pipefail
 
 STAGE="${1:-dev}"
 REGION="${2:-${AWS_REGION:-us-east-1}}"
+PROJECT="01-key-value-store"
 STACK="kv-store-${STAGE}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="${DIR}/infrastructure/kv-store.yaml"
+PACKAGED="${DIR}/build/packaged.yaml"
 
-echo "Account: $(aws sts get-caller-identity --query Account --output text)  Region: ${REGION}  Stack: ${STACK}"
+ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+BUCKET="cfn-artifacts-${ACCOUNT}-${REGION}"
+echo "Account: ${ACCOUNT}  Region: ${REGION}  Stack: ${STACK}"
 
+# 1. Private artifact bucket for Lambda zips (created once per account/region).
+if ! aws s3api head-bucket --bucket "$BUCKET" --expected-bucket-owner "$ACCOUNT" 2>/dev/null; then
+  echo "Creating private artifact bucket ${BUCKET}"
+  if [[ "$REGION" == "us-east-1" ]]; then
+    aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null
+  else
+    aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+      --create-bucket-configuration "LocationConstraint=${REGION}" >/dev/null
+  fi
+  aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  aws s3api put-bucket-encryption --bucket "$BUCKET" --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+  aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration \
+    '{"Rules":[{"ID":"expire-old-artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
+fi
+
+# 2. Validate, package src/ -> S3, deploy.
 aws cloudformation validate-template --region "$REGION" --template-body "file://${TEMPLATE}" >/dev/null
 echo "Template valid."
+
+mkdir -p "${DIR}/build"
+aws cloudformation package --region "$REGION" \
+  --template-file "$TEMPLATE" \
+  --s3-bucket "$BUCKET" --s3-prefix "$PROJECT" \
+  --output-template-file "$PACKAGED" >/dev/null
 
 aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK" \
-  --template-file "$TEMPLATE" \
+  --template-file "$PACKAGED" \
   --parameter-overrides "Stage=${STAGE}" \
   --capabilities CAPABILITY_IAM \
-  --tags Project=01-key-value-store "Stage=${STAGE}"
+  --tags "Project=${PROJECT}" "Stage=${STAGE}"
 
 aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
   --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table

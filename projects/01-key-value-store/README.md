@@ -1,5 +1,14 @@
 # 01 · Key-Value Store
 
+![Status](https://img.shields.io/badge/status-prototype-yellow)
+![IaC](https://img.shields.io/badge/IaC-CloudFormation-FF4F8B?logo=amazonaws&logoColor=white)
+![Auth](https://img.shields.io/badge/auth-IAM%20SigV4-232F3E?logo=amazonaws&logoColor=white)
+![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+
+[← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/kv-store.yaml) · [Code](src/handler.py)
+
+![Architecture](docs/images/architecture.png)
+
 ## Summary
 
 A serverless key-value store with a REST API. Clients `PUT`, `GET`, `DELETE`, and list keys over HTTPS. Every request is authenticated with AWS IAM (SigV4). Values are any JSON, with an optional per-key TTL. The whole stack is one CloudFormation template.
@@ -13,6 +22,8 @@ A serverless key-value store with a REST API. Clients `PUT`, `GET`, `DELETE`, an
 | Cost at idle | ~$0 (all pay-per-request) |
 
 ## Architecture
+
+The image above uses official AWS icons and is generated from [`docs/diagram.py`](docs/diagram.py). The same flow as a Mermaid diagram:
 
 ```mermaid
 flowchart LR
@@ -46,14 +57,18 @@ Detailed flows: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/ar
 ├── README.md                 ← this file
 ├── docs/
 │   ├── architecture.md       ← components, data model, decisions
-│   └── workflow.md           ← sequence diagrams, deploy lifecycle
+│   ├── workflow.md           ← sequence diagrams, deploy lifecycle
+│   ├── diagram.py            ← diagram-as-code (AWS icons)
+│   └── images/architecture.png
 ├── infrastructure/
-│   └── kv-store.yaml         ← CloudFormation (includes inline Lambda code)
+│   └── kv-store.yaml         ← CloudFormation stack
 ├── src/
-│   └── README.md             ← where the code lives and why
+│   └── handler.py            ← Lambda handler
+├── tests/
+│   └── integration/
+│       └── test_api.py       ← SigV4-signed end-to-end test
 └── scripts/
-    ├── deploy.sh             ← validate + deploy stack, print outputs
-    ├── test_kv.py            ← signed end-to-end smoke test
+    ├── deploy.sh             ← package src/ + deploy stack, print outputs
     └── destroy.sh            ← delete stack
 ```
 
@@ -62,7 +77,9 @@ Detailed flows: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/ar
 ```bash
 cd projects/01-key-value-store
 
-# 1. Deploy (stage defaults to dev, region to $AWS_REGION or us-east-1)
+# 1. Deploy (stage defaults to dev, region to $AWS_REGION or us-east-1).
+#    Creates a private artifact bucket cfn-artifacts-<account>-<region> on first run,
+#    uploads src/ with `aws cloudformation package`, then deploys.
 ./scripts/deploy.sh dev us-east-1
 
 # 2. Grant your IAM user/role access (ARN from the ClientPolicyArn output)
@@ -71,7 +88,7 @@ aws iam attach-user-policy --user-name <you> --policy-arn <ClientPolicyArn>
 
 # 3. Test
 pip install boto3
-python3 scripts/test_kv.py dev us-east-1
+python3 tests/integration/test_api.py dev us-east-1
 
 # 4. Tear down (deletes all stored data)
 ./scripts/destroy.sh dev us-east-1
@@ -83,6 +100,7 @@ python3 scripts/test_kv.py dev us-east-1
 - **Auth:** every method uses `AWS_IAM`. Nothing is anonymously reachable. The smoke test checks that an unsigned request gets `403`.
 - **Least privilege:** the Lambda role can only touch this table and its own log group. The client policy only allows invoking this API's stage.
 - **Data:** encrypted at rest (DynamoDB SSE), PITR on. `DeletionPolicy: Delete` because it's a prototype; set `Retain` before holding real data.
+- **Artifacts:** Lambda zips go to a private bucket (Block Public Access on, SSE, 30-day expiry).
 - **Abuse limits:** stage throttling 10 rps / burst 20; key ≤ 256 chars; value ≤ 350 KB.
 
 ## What I learned / next steps
@@ -90,4 +108,4 @@ python3 scripts/test_kv.py dev us-east-1
 - [ ] Add a conditional write (`If-Match` / version number) for optimistic concurrency
 - [ ] Paginate `GET /kv` with `LastEvaluatedKey`
 - [ ] Add CloudWatch alarms on Lambda errors and API 5xx
-- [ ] Move Lambda code to `src/` + `aws cloudformation package` once it grows past inline size
+- [ ] Unit tests for `src/handler.py` with a DynamoDB stub

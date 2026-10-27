@@ -77,10 +77,14 @@ Resources:
   KvFunction:
     Type: AWS::Lambda::Function
     DependsOn: KvFunctionLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
     Properties:
       FunctionName: !Sub kv-store-${Stage}
       Runtime: python3.12
-      Handler: index.handler
+      Handler: handler.handler
       Role: !GetAtt KvFunctionRole.Arn
       Timeout: 10
       MemorySize: 256
@@ -90,73 +94,8 @@ Resources:
       Tags:
         - { Key: Project, Value: 01-key-value-store }
         - { Key: Stage, Value: !Ref Stage }
-      Code:
-        ZipFile: |
-          """Key-value store handler. Routes:
-          GET    /kv          list keys (max 100)
-          GET    /kv/{key}    read value
-          PUT    /kv/{key}    body {"value": <any JSON>, "ttlSeconds": <int, optional>}
-          DELETE /kv/{key}    delete key
-          """
-          import json, os, time
-          import boto3
-
-          TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
-          MAX_KEY_LEN = 256
-          MAX_VALUE_BYTES = 350_000  # DynamoDB item limit is 400 KB
-
-          def resp(code, body):
-              return {"statusCode": code,
-                      "headers": {"Content-Type": "application/json"},
-                      "body": json.dumps(body)}
-
-          def handler(event, context):
-              method = event.get("httpMethod")
-              key = (event.get("pathParameters") or {}).get("key")
-
-              if key is None:
-                  if method != "GET":
-                      return resp(405, {"error": "method not allowed"})
-                  items = TABLE.scan(Limit=100, ProjectionExpression="pk").get("Items", [])
-                  return resp(200, {"keys": [i["pk"] for i in items]})
-
-              if not key or len(key) > MAX_KEY_LEN:
-                  return resp(400, {"error": f"key must be 1-{MAX_KEY_LEN} chars"})
-
-              if method == "GET":
-                  item = TABLE.get_item(Key={"pk": key}).get("Item")
-                  if not item or ("expiresAt" in item and int(item["expiresAt"]) < time.time()):
-                      return resp(404, {"error": "not found"})
-                  return resp(200, {"key": key, "value": json.loads(item["value"]),
-                                    "updatedAt": int(item["updatedAt"])})
-
-              if method == "PUT":
-                  try:
-                      body = json.loads(event.get("body") or "{}")
-                  except json.JSONDecodeError:
-                      return resp(400, {"error": "body must be JSON"})
-                  if not isinstance(body, dict) or "value" not in body:
-                      return resp(400, {"error": "body must be {\"value\": ...}"})
-                  value = json.dumps(body["value"])
-                  if len(value.encode()) > MAX_VALUE_BYTES:
-                      return resp(413, {"error": "value too large"})
-                  now = int(time.time())
-                  item = {"pk": key, "value": value, "updatedAt": now}
-                  ttl = body.get("ttlSeconds")
-                  if ttl is not None:
-                      if not isinstance(ttl, int) or ttl <= 0:
-                          return resp(400, {"error": "ttlSeconds must be a positive integer"})
-                      item["expiresAt"] = now + ttl
-                  TABLE.put_item(Item=item)
-                  return resp(200, {"key": key, "updatedAt": now})
-
-              if method == "DELETE":
-                  old = TABLE.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD").get("Attributes")
-                  if not old:
-                      return resp(404, {"error": "not found"})
-                  return resp(200, {"deleted": key})
-
-              return resp(405, {"error": "method not allowed"})
+      # Local path; `aws cloudformation package` zips it and uploads to S3.
+      Code: ../src/
 
   # ---------- API ----------
   KvApi:

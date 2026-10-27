@@ -58,13 +58,13 @@ stateDiagram-v2
     Deploying --> RolledBack: failure
     RolledBack --> Validate: fix template
     Deployed --> GrantAccess: attach KvClientPolicy
-    GrantAccess --> Tested: python3 scripts/test_kv.py
+    GrantAccess --> Tested: python3 tests/integration/test_api.py
     Tested --> Deployed: change + redeploy
     Tested --> Deleted: ./scripts/destroy.sh
     Deleted --> [*]
 ```
 
-## Smoke test checks (`scripts/test_kv.py`)
+## Smoke test checks (`tests/integration/test_api.py`)
 
 | # | Check | Expected |
 |---|-------|----------|
