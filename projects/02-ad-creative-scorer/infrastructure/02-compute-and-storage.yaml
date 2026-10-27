@@ -1,0 +1,418 @@
+# =============================================================================
+# TEMPLATE 2: Compute & Storage Layer — DynamoDB, Lambda Functions
+# Stack Name: ad-scorer-<env>-compute
+# Deploy SECOND — depends on Foundation stack exports.
+# Lambda code lives in ../src/<function>/ and is uploaded by
+# `aws cloudformation package` (see scripts/deploy.sh).
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Compute and storage stack for the Ad Creative Scorer.
+  Provisions the DynamoDB scores table and the five Lambda functions
+  (feature extraction, inference, presigned URL, pipeline trigger, get score).
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ad-scorer
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  LambdaRuntimeVersion:
+    Type: String
+    Default: python3.12
+    Description: Lambda Python runtime version
+
+  LambdaMemoryFeatureExtraction:
+    Type: Number
+    Default: 1024
+    Description: Memory (MB) for the Feature Extraction Lambda. Higher = faster Rekognition calls.
+
+  LambdaTimeoutFeatureExtraction:
+    Type: Number
+    Default: 300
+    Description: Timeout (seconds) for the Feature Extraction Lambda (EXPRESS workflows cap at 5 min).
+
+  LambdaMemoryInference:
+    Type: Number
+    Default: 512
+
+  LambdaTimeoutInference:
+    Type: Number
+    Default: 60
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: >
+      PAY_PER_REQUEST for dev/variable workloads.
+      PROVISIONED for predictable high-volume production traffic.
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB: Creative Scoring Results ───────────────────────────────────────
+  # Schema:
+  #   PK: creativeId (String) — UUID issued by POST /v1/upload
+  #   SK: scoredAt  (String) — ISO-8601 timestamp of the scoring request
+  #   Attributes: status, campaignId, s3Key, ctrScore, engagementScore,
+  #               moderationFlags, featureS3Key, errorDetails
+  # Prototype: scores are derived data, so the table is deleted with the stack.
+  CreativeScoringTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-scores-${Environment}"
+      BillingMode: !Ref DynamoDBBillingMode
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue
+          Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      AttributeDefinitions:
+        - AttributeName: creativeId
+          AttributeType: S
+        - AttributeName: scoredAt
+          AttributeType: S
+        - AttributeName: campaignId
+          AttributeType: S
+        - AttributeName: ctrScore
+          AttributeType: N
+      KeySchema:
+        - AttributeName: creativeId
+          KeyType: HASH
+        - AttributeName: scoredAt
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI 1: Query all creatives by campaign, sorted by score
+        - IndexName: CampaignScoreIndex
+          KeySchema:
+            - AttributeName: campaignId
+              KeyType: HASH
+            - AttributeName: ctrScore
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - creativeId
+              - scoredAt
+              - status
+              - engagementScore
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudWatch Log Groups — KMS-encrypted, explicit retention ────────────────
+  FeatureExtractionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-feature-extraction-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InferenceLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-inference-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PresignedURLLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-presigned-url-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PipelineTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-pipeline-trigger-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  GetScoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-get-score-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-KMSKeyArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Function: Feature Extraction ──────────────────────────────────────
+  # Invoked by the Step Functions state machine (not directly by S3).
+  FeatureExtractionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FeatureExtractionLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${ProjectName}-feature-extraction-${Environment}"
+      Description: >
+        Analyses a creative in S3 with Rekognition (labels, faces, text,
+        moderation) and returns structured feature JSON.
+      Runtime: !Ref LambdaRuntimeVersion
+      Handler: handler.handler
+      MemorySize: !Ref LambdaMemoryFeatureExtraction
+      Timeout: !Ref LambdaTimeoutFeatureExtraction
+      Role: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-LambdaFeatureExtractionRoleArn"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          CREATIVE_BUCKET: !ImportValue
+            Fn::Sub: "${ProjectName}-${Environment}-CreativeAssetsBucket"
+          ML_ARTIFACTS_BUCKET: !ImportValue
+            Fn::Sub: "${ProjectName}-${Environment}-MLArtifactsBucket"
+          SCORES_TABLE: !Ref CreativeScoringTable
+          # Rekognition — control which detections are enabled (cost control)
+          REKOGNITION_FACE_ENABLED: "true"
+          REKOGNITION_LABELS_MAX: "20"
+          REKOGNITION_TEXT_ENABLED: "true"
+          REKOGNITION_MODERATION_ENABLED: "true"
+          LOG_LEVEL: INFO
+      ReservedConcurrentExecutions: 50  # Prevent Rekognition quota exhaustion
+      TracingConfig:
+        Mode: Active
+      Code: ../src/feature_extraction/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Function: Inference ───────────────────────────────────────────────
+  # Receives the feature dict from Step Functions, calls the SageMaker
+  # endpoint, and writes the CTR/engagement score to DynamoDB.
+  InferenceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: InferenceLambdaLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${ProjectName}-inference-${Environment}"
+      Description: >
+        Calls the SageMaker scoring endpoint with extracted features and
+        writes the predicted CTR score to DynamoDB.
+      Runtime: !Ref LambdaRuntimeVersion
+      Handler: handler.handler
+      MemorySize: !Ref LambdaMemoryInference
+      Timeout: !Ref LambdaTimeoutInference
+      Role: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-LambdaInferenceRoleArn"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SCORES_TABLE: !Ref CreativeScoringTable
+          # Endpoint is created by stack 05 under this fixed name.
+          SAGEMAKER_ENDPOINT_NAME: !Sub "${ProjectName}-scoring-endpoint-${Environment}"
+          LOG_LEVEL: INFO
+      TracingConfig:
+        Mode: Active
+      Code: ../src/inference/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda: Presigned URL Generator (POST /v1/upload) ────────────────────────
+  PresignedURLFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PresignedURLLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${ProjectName}-presigned-url-${Environment}"
+      Description: Generates S3 presigned PUT URLs (uploads/ prefix only) for client-side creative uploads
+      Runtime: !Ref LambdaRuntimeVersion
+      Handler: handler.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-LambdaPresignedURLRoleArn"
+      Environment:
+        Variables:
+          CREATIVE_BUCKET: !ImportValue
+            Fn::Sub: "${ProjectName}-${Environment}-CreativeAssetsBucket"
+          URL_EXPIRY_SECONDS: "3600"
+      TracingConfig:
+        Mode: Active
+      Code: ../src/presigned_url/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda: Pipeline Trigger (POST /v1/score) ────────────────────────────────
+  PipelineTriggerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PipelineTriggerLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${ProjectName}-pipeline-trigger-${Environment}"
+      Description: >
+        Validates POST /v1/score, seeds a PENDING item, starts the Step
+        Functions execution and returns 202 (async scoring pattern).
+      Runtime: !Ref LambdaRuntimeVersion
+      Handler: handler.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-LambdaPipelineTriggerRoleArn"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SCORES_TABLE: !Ref CreativeScoringTable
+          CREATIVE_BUCKET: !ImportValue
+            Fn::Sub: "${ProjectName}-${Environment}-CreativeAssetsBucket"
+          # Written by stack 04; read at runtime so 02 does not depend on 04.
+          STATE_MACHINE_ARN_PARAM: !Sub "/${ProjectName}/${Environment}/stepfunctions/state-machine-arn"
+      TracingConfig:
+        Mode: Active
+      Code: ../src/pipeline_trigger/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda: Get Score (GET /v1/score/{creativeId}) ───────────────────────────
+  GetScoreFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetScoreLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-score-${Environment}"
+      Description: Returns the latest score record for a creative (read-only DynamoDB query)
+      Runtime: !Ref LambdaRuntimeVersion
+      Handler: handler.handler
+      MemorySize: 256
+      Timeout: 10
+      Role: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-LambdaGetScoreRoleArn"
+      Environment:
+        Variables:
+          SCORES_TABLE: !Ref CreativeScoringTable
+      TracingConfig:
+        Mode: Active
+      Code: ../src/get_score/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  CreativeScoringTableName:
+    Description: DynamoDB table name for scoring results
+    Value: !Ref CreativeScoringTable
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ScoringTableName"
+
+  CreativeScoringTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt CreativeScoringTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ScoringTableArn"
+
+  FeatureExtractionFunctionArn:
+    Description: Feature Extraction Lambda ARN
+    Value: !GetAtt FeatureExtractionFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-FeatureExtractionLambdaArn"
+
+  InferenceFunctionArn:
+    Description: Inference Lambda ARN
+    Value: !GetAtt InferenceFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-InferenceLambdaArn"
+
+  PresignedURLFunctionArn:
+    Description: Presigned URL Generator Lambda ARN
+    Value: !GetAtt PresignedURLFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-PresignedURLLambdaArn"
+
+  PipelineTriggerFunctionArn:
+    Description: Pipeline Trigger Lambda ARN
+    Value: !GetAtt PipelineTriggerFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-PipelineTriggerLambdaArn"
+
+  GetScoreFunctionArn:
+    Description: Get Score Lambda ARN
+    Value: !GetAtt GetScoreFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-GetScoreLambdaArn"

@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "03-rate-limiter - replace with a one-line description."
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Deployment stage, used in names and tags.
+
+Resources:
+  # Placeholder so the stack deploys before real resources exist. Delete it once you add yours.
+  # Lambda pattern: Code: ../src/<function>/ (packaged by scripts/deploy.sh), plus
+  #   Metadata: { cfn-lint: { config: { ignore_checks: [W3002] } } }
+  # API pattern: AuthorizationType: AWS_IAM on every method + a client ManagedPolicy output.
+  PlaceholderParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/rate-limiter/${Stage}/placeholder"
+      Type: String
+      Value: replace-me
+      Tags:
+        Project: "03-rate-limiter"
+        Stage: !Ref Stage
+
+Outputs:
+  PlaceholderName:
+    Value: !Ref PlaceholderParam

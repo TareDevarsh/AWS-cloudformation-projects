@@ -1,0 +1,764 @@
+# =============================================================================
+# TEMPLATE 1: Foundation Layer — KMS, S3, IAM roles, SSM parameters
+# Stack Name: ad-scorer-<env>-foundation
+# Deploy FIRST — every other stack imports exports from this stack.
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Foundation stack for the Predictive Ad Creative Performance Scorer.
+  Provisions the KMS key, S3 buckets, and one least-privilege IAM role per
+  Lambda function, plus the Step Functions and SageMaker roles.
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ad-scorer
+    Description: Short project identifier used as a prefix for all resource names.
+    AllowedPattern: "^[a-z0-9-]{3,20}$"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  RetentionDays:
+    Type: Number
+    Default: 90
+    Description: Days to retain raw creative assets in S3 before transitioning to Glacier.
+
+# ─── Mappings ─────────────────────────────────────────────────────────────────
+# Account that hosts the SageMaker built-in XGBoost image in each region.
+# Source: sagemaker-python-sdk image_uri_config/xgboost.json (version 1.7-1).
+# Deploying to a region not listed here fails at Fn::FindInMap; add the
+# region's account from
+# https://docs.aws.amazon.com/sagemaker/latest/dg-ecr-paths/sagemaker-algo-docker-registry-paths.html
+Mappings:
+  XGBoostRegistry:
+    us-east-1:
+      Account: "683313688378"
+    us-east-2:
+      Account: "257758044811"
+    us-west-2:
+      Account: "246618743249"
+    eu-west-1:
+      Account: "141502667606"
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── KMS Key for all encryption at rest ──────────────────────────────────────
+  # Retained on delete so the retained S3 buckets stay decryptable.
+  ScorerKMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Encryption key for ${ProjectName}-${Environment} assets and data"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"   # key policy: "*" means this key
+          # CloudWatch Logs encrypts the KMS-protected log groups (Lambda,
+          # API Gateway access logs, Step Functions).
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"   # key policy: "*" means this key
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          # CloudWatch alarms publish to the KMS-encrypted SNS alerts topic.
+          - Sid: AllowCloudWatchAlarmsToSNS
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: "*"   # key policy: "*" means this key
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          # SageMaker (endpoint storage, data capture) and Step Functions,
+          # limited to calls made on behalf of this account.
+          - Sid: AllowServicePrincipals
+            Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+                - states.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"   # key policy: "*" means this key
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ScorerKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${Environment}-key"
+      TargetKeyId: !Ref ScorerKMSKey
+
+  # ── S3 Bucket: Raw creative asset ingestion ──────────────────────────────────
+  # Retained on delete; scripts/destroy.sh empties and deletes it on request.
+  CreativeAssetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-creative-assets-${AWS::AccountId}-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ScorerKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref RetentionDays
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CreativeAssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CreativeAssetsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLSRequests
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CreativeAssetsBucket.Arn
+              - !Sub "${CreativeAssetsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ── S3 Bucket: SageMaker training data and model artifacts ──────────────────
+  # Retained on delete; scripts/destroy.sh empties and deletes it on request.
+  MLArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-ml-artifacts-${AWS::AccountId}-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ScorerKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  MLArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MLArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLSRequests
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt MLArtifactsBucket.Arn
+              - !Sub "${MLArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ── IAM Role: Lambda — Feature Extraction ────────────────────────────────────
+  LambdaFeatureExtractionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-feature-extraction-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FeatureExtractionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-feature-extraction-${Environment}:*"
+              # Read creative assets. Rekognition reads S3Object images with
+              # the caller's credentials, so this grant covers it too.
+              - Sid: S3ReadCreatives
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${CreativeAssetsBucket.Arn}/uploads/*"
+              - Sid: S3WriteFeatures
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${MLArtifactsBucket.Arn}/features/*"
+              # Rekognition image APIs have no resource-level permissions,
+              # so Resource must be "*".
+              - Sid: RekognitionImageAnalysis
+                Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                  - rekognition:DetectFaces
+                  - rekognition:DetectText
+                  - rekognition:DetectModerationLabels
+                Resource: "*"
+              - Sid: DynamoDBUpdateStatus
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-scores-${Environment}"
+              # Decrypt covers SSE-KMS creative objects (including the reads
+              # Rekognition makes with this role); GenerateDataKey covers the
+              # feature JSON PutObject and the CMK-encrypted table.
+              - Sid: KMSUse
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # X-Ray has no resource-level permissions (TracingConfig: Active).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: Lambda — Inference ─────────────────────────────────────────────
+  LambdaInferenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-inference-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InferencePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-inference-${Environment}:*"
+              - Sid: SageMakerInvokeEndpoint
+                Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: !Sub "arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ProjectName}-scoring-endpoint-${Environment}"
+              - Sid: DynamoDBWriteScore
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-scores-${Environment}"
+              - Sid: KMSUse
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # X-Ray has no resource-level permissions (TracingConfig: Active).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: Lambda — Presigned URL ─────────────────────────────────────────
+  # The presigned PUT URL is signed with this role's credentials, so the role
+  # itself must be allowed to PutObject under uploads/ and use the bucket key.
+  LambdaPresignedURLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-presigned-url-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PresignedURLPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-presigned-url-${Environment}:*"
+              - Sid: S3PutUploads
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${CreativeAssetsBucket.Arn}/uploads/*"
+              - Sid: KMSForUploads
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # X-Ray has no resource-level permissions (TracingConfig: Active).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: Lambda — Pipeline Trigger ──────────────────────────────────────
+  LambdaPipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-pipeline-trigger-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineTriggerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-pipeline-trigger-${Environment}:*"
+              - Sid: DynamoDBSeedItem
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-scores-${Environment}"
+              - Sid: KMSUse
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              - Sid: StartPipeline
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-pipeline-${Environment}"
+              - Sid: ReadStateMachineArnParam
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Environment}/stepfunctions/state-machine-arn"
+              # X-Ray has no resource-level permissions (TracingConfig: Active).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: Lambda — Get Score (read-only) ─────────────────────────────────
+  LambdaGetScoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-get-score-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetScorePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-get-score-${Environment}:*"
+              - Sid: DynamoDBQueryScores
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-scores-${Environment}"
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # X-Ray has no resource-level permissions (TracingConfig: Active).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: SageMaker Training & Hosting ───────────────────────────────────
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-sagemaker-execution-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SageMakerLeastPrivilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ArtifactsReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MLArtifactsBucket.Arn
+                  - !Sub "${MLArtifactsBucket.Arn}/*"
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # Grants let SageMaker attach the key to training/endpoint EBS volumes.
+              - Sid: KMSGrantForVolumes
+                Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                Resource: !GetAtt ScorerKMSKey.Arn
+                Condition:
+                  Bool:
+                    "kms:GrantIsForAWSResource": "true"
+              - Sid: ECRPullXGBoostImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:ecr:${AWS::Region}:${RegistryAccount}:repository/sagemaker-xgboost"
+                  - RegistryAccount: !FindInMap [XGBoostRegistry, !Ref "AWS::Region", Account]
+              # GetAuthorizationToken has no resource-level permissions.
+              - Sid: ECRAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: SageMakerLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*"
+              # PutMetricData has no resource-level permissions; limited by namespace.
+              - Sid: SageMakerMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    "cloudwatch:namespace":
+                      - "/aws/sagemaker/*"
+                      - "aws/sagemaker/*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: Step Functions State Machine ───────────────────────────────────
+  # Scoped to exactly what the 04 state machine calls.
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-stepfunctions-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsOrchestrationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokePipelineLambdas
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-feature-extraction-${Environment}"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-feature-extraction-${Environment}:*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-inference-${Environment}"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-inference-${Environment}:*"
+              # FlaggedForModeration and UpdateStatusFailed states.
+              - Sid: DynamoDBUpdateStatus
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-scores-${Environment}"
+              # The scores table is encrypted with the CMK.
+              - Sid: KMSForTable
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt ScorerKMSKey.Arn
+              # PublishScoringEvent state.
+              - Sid: PublishEvents
+                Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+              # X-Ray has no resource-level permissions (TracingConfiguration enabled).
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # Vended log delivery for EXPRESS logging requires Resource "*".
+              - Sid: LogsDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SSM Parameter Store — resource names for scripts and other tools ─────────
+  SSMCreativeAssetsBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/s3/creative-assets-bucket"
+      Type: String
+      Value: !Ref CreativeAssetsBucket
+      Description: S3 bucket name for creative asset ingestion
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  SSMMLArtifactsBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/s3/ml-artifacts-bucket"
+      Type: String
+      Value: !Ref MLArtifactsBucket
+      Description: S3 bucket name for ML training data and model artifacts
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  SSMKMSKeyArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/kms/key-arn"
+      Type: String
+      Value: !GetAtt ScorerKMSKey.Arn
+      Description: KMS key ARN for encryption at rest
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  CreativeAssetsBucketName:
+    Description: S3 bucket for raw creative ingestion
+    Value: !Ref CreativeAssetsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-CreativeAssetsBucket"
+
+  MLArtifactsBucketName:
+    Description: S3 bucket for ML artifacts
+    Value: !Ref MLArtifactsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-MLArtifactsBucket"
+
+  KMSKeyArn:
+    Description: KMS key ARN
+    Value: !GetAtt ScorerKMSKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-KMSKeyArn"
+
+  LambdaFeatureExtractionRoleArn:
+    Description: IAM Role ARN for Feature Extraction Lambda
+    Value: !GetAtt LambdaFeatureExtractionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-LambdaFeatureExtractionRoleArn"
+
+  LambdaInferenceRoleArn:
+    Description: IAM Role ARN for Inference Lambda
+    Value: !GetAtt LambdaInferenceRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-LambdaInferenceRoleArn"
+
+  LambdaPresignedURLRoleArn:
+    Description: IAM Role ARN for Presigned URL Lambda
+    Value: !GetAtt LambdaPresignedURLRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-LambdaPresignedURLRoleArn"
+
+  LambdaPipelineTriggerRoleArn:
+    Description: IAM Role ARN for Pipeline Trigger Lambda
+    Value: !GetAtt LambdaPipelineTriggerRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-LambdaPipelineTriggerRoleArn"
+
+  LambdaGetScoreRoleArn:
+    Description: IAM Role ARN for Get Score Lambda (read-only)
+    Value: !GetAtt LambdaGetScoreRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-LambdaGetScoreRoleArn"
+
+  SageMakerExecutionRoleArn:
+    Description: IAM Role ARN for SageMaker (used by scripts/train.sh and stack 05)
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-SageMakerRoleArn"
+
+  StepFunctionsRoleArn:
+    Description: IAM Role ARN for Step Functions
+    Value: !GetAtt StepFunctionsRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-StepFunctionsRoleArn"
+
+  XGBoostImageRepo:
+    Description: Regional SageMaker built-in XGBoost image repository (append :<version>)
+    Value: !Sub
+      - "${RegistryAccount}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/sagemaker-xgboost"
+      - RegistryAccount: !FindInMap [XGBoostRegistry, !Ref "AWS::Region", Account]
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-XGBoostImageRepo"

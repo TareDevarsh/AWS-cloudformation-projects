@@ -1,6 +1,6 @@
 # AWS CloudFormation Projects
 
-![Projects](https://img.shields.io/badge/projects-2-blue)
+![Projects](https://img.shields.io/badge/projects-3-blue)
 ![IaC](https://img.shields.io/badge/IaC-CloudFormation-FF4F8B?logo=amazonaws&logoColor=white)
 ![Auth](https://img.shields.io/badge/default%20auth-IAM%20SigV4-232F3E?logo=amazonaws&logoColor=white)
 ![Lint](https://img.shields.io/badge/cfn--lint-passing-brightgreen)
@@ -14,6 +14,7 @@ Every project lives in [`projects/`](projects/) and is self-contained: it has it
 |---|---------|---------------|--------------|--------|
 | 01 | [**Key-Value Store**](projects/01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](projects/02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
+| 03 | [**Rate Limiter**](projects/03-rate-limiter/) | Rate limiter middleware (token bucket in Redis) in front of a Lambda backend, latency measured at every step | EC2 · Docker · Redis · S3 · Lambda | ⚪ Planned |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -39,6 +40,9 @@ Every entry below is a link, so you can jump straight to the file.
     - [Architecture](projects/02-ad-creative-scorer/docs/architecture.md) · [Workflows](projects/02-ad-creative-scorer/docs/workflow.md)
     - [Templates: 01 to 06 stacks](projects/02-ad-creative-scorer/infrastructure/) · [Code: 5 Lambdas](projects/02-ad-creative-scorer/src/)
     - [Integration test](projects/02-ad-creative-scorer/tests/integration/test_api.py) · [Scripts](projects/02-ad-creative-scorer/scripts/)
+  - 📦 **[03 · Rate Limiter](projects/03-rate-limiter/)**
+    - [Architecture](projects/03-rate-limiter/docs/architecture.md) · [Workflows](projects/03-rate-limiter/docs/workflow.md)
+    - [Template](projects/03-rate-limiter/infrastructure/template.yaml) · [Code](projects/03-rate-limiter/src/) · [Scripts](projects/03-rate-limiter/scripts/)
 
 ```mermaid
 mindmap
@@ -52,6 +56,10 @@ mindmap
       Rekognition features
       SageMaker XGBoost
       6 layered stacks
+    03 Rate Limiter
+      Middleware on EC2 + Docker
+      Token bucket in Redis
+      Latency at every step
     Shared
       CONVENTIONS.md
       _template
@@ -89,13 +97,20 @@ aws-projects/
 │   │   ├── src/                 ← handler.py
 │   │   ├── tests/integration/   ← test_api.py
 │   │   └── scripts/             ← deploy.sh, destroy.sh
-│   └── 02-ad-creative-scorer/
-│       ├── README.md
+│   ├── 02-ad-creative-scorer/
+│   │   ├── README.md
+│   │   ├── docs/
+│   │   ├── infrastructure/      ← 01-foundation … 06-monitoring (deploy in order)
+│   │   ├── src/                 ← one folder per Lambda
+│   │   ├── tests/integration/
+│   │   └── scripts/             ← deploy.sh, train.sh, destroy.sh
+│   └── 03-rate-limiter/
+│       ├── README.md            ← goal, latency log
 │       ├── docs/
-│       ├── infrastructure/      ← 01-foundation … 06-monitoring (deploy in order)
-│       ├── src/                 ← one folder per Lambda
+│       ├── infrastructure/
+│       ├── src/
 │       ├── tests/integration/
-│       └── scripts/             ← deploy.sh, train.sh, destroy.sh
+│       └── scripts/
 └── .kiro/steering/              ← keeps Kiro/MCP following these conventions
 ```
 
@@ -109,12 +124,14 @@ graph TD
     R --> T[_template/]
     R --> P1[01 README]
     R --> P2[02 README]
+    R --> P3[03 README]
     P1 --> A1[architecture.md] & W1[workflow.md]
     P2 --> A2[architecture.md] & W2[workflow.md]
     A1 --> I1[infrastructure/*.yaml]
     A2 --> I2[infrastructure/01…06.yaml]
     W1 --> S1[scripts + tests]
     W2 --> S2[scripts + tests]
+    P3 --> A3[architecture.md] & W3[workflow.md]
 ```
 
 ## Reading guide (for reviewers)

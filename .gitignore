@@ -26,3 +26,10 @@ packaged*.yaml
 
 # Local session instructions (not published)
 .instructions/
+
+# Extra safety
+*.log
+.aws/
+*credentials*
+*.tfstate*
+samconfig.toml
