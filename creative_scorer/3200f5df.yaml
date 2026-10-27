@@ -1,0 +1,349 @@
+# =============================================================================
+# TEMPLATE 3: Ingestion API — API Gateway REST API
+# Stack Name: ad-scorer-api
+# Deploy THIRD — depends on Compute stack exports.
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  API Gateway REST API for the Ad Creative Scorer.
+  Exposes endpoints for creative upload (presigned URL generation) and scoring.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ad-scorer
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  APIThrottleBurstLimit:
+    Type: Number
+    Default: 100
+    Description: API Gateway burst limit (requests per second burst)
+
+  APIThrottleRateLimit:
+    Type: Number
+    Default: 50
+    Description: API Gateway steady-state rate limit (requests/second)
+
+  EnableAPIKey:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Require API key for all endpoints (recommended for prod)
+
+Resources:
+
+  # ── REST API Definition ───────────────────────────────────────────────────────
+  AdScorerAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Environment}"
+      Description: Ad Creative Performance Scorer REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      MinimumCompressionSize: 1024  # Compress responses > 1KB
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── CloudWatch Role for API Gateway access logs ────────────────────────────
+  APIGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigw-cloudwatch-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  APIGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt APIGatewayCloudWatchRole.Arn
+
+  # ── Access Log Group ──────────────────────────────────────────────────────────
+  APIAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-access-${Environment}"
+      RetentionInDays: 30
+
+  # ── API Resources ─────────────────────────────────────────────────────────────
+
+  # /v1
+  V1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ParentId: !GetAtt AdScorerAPI.RootResourceId
+      PathPart: v1
+
+  # /v1/upload
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ParentId: !Ref V1Resource
+      PathPart: upload
+
+  # /v1/score
+  ScoreResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ParentId: !Ref V1Resource
+      PathPart: score
+
+  # /v1/score/{creativeId}
+  ScoreByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ParentId: !Ref ScoreResource
+      PathPart: "{creativeId}"
+
+  # ── Lambda Permissions for API Gateway ────────────────────────────────────────
+  PresignedURLLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-PresignedURLLambdaArn"
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AdScorerAPI}/*/POST/v1/upload"
+
+  PipelineTriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !ImportValue
+        Fn::Sub: "${ProjectName}-${Environment}-PipelineTriggerLambdaArn"
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AdScorerAPI}/*/POST/v1/score"
+
+  # ── POST /v1/upload — Generate presigned upload URL ───────────────────────────
+  UploadPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [RequireAPIKey, true, false]
+      RequestValidatorId: !Ref RequestBodyValidator
+      RequestModels:
+        application/json: !Ref UploadRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-PresignedURLLambdaArn"
+      MethodResponses:
+        - StatusCode: "200"
+        - StatusCode: "400"
+        - StatusCode: "500"
+
+  # ── POST /v1/score — Submit asset for scoring (async) ─────────────────────────
+  ScorePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ResourceId: !Ref ScoreResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [RequireAPIKey, true, false]
+      RequestValidatorId: !Ref RequestBodyValidator
+      RequestModels:
+        application/json: !Ref ScoreRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-PipelineTriggerLambdaArn"
+      MethodResponses:
+        - StatusCode: "202"
+        - StatusCode: "400"
+        - StatusCode: "500"
+
+  # ── GET /v1/score/{creativeId} — Poll for score result ────────────────────────
+  # Direct DynamoDB integration — no Lambda needed for simple GET
+  ScoreGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ResourceId: !Ref ScoreByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [RequireAPIKey, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !ImportValue
+              Fn::Sub: "${ProjectName}-${Environment}-InferenceLambdaArn"
+      MethodResponses:
+        - StatusCode: "200"
+        - StatusCode: "404"
+
+  # ── Request Validator ─────────────────────────────────────────────────────────
+  RequestBodyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      Name: ValidateBody
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  # ── Request Models (JSON Schema validation) ────────────────────────────────────
+  UploadRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ContentType: application/json
+      Name: UploadRequest
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        type: object
+        required: [content_type, campaign_id]
+        properties:
+          content_type:
+            type: string
+            enum: [image/jpeg, image/png, image/webp, image/gif, video/mp4, video/quicktime]
+          campaign_id:
+            type: string
+            minLength: 1
+            maxLength: 64
+
+  ScoreRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      ContentType: application/json
+      Name: ScoreRequest
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        type: object
+        required: [s3_bucket, s3_key, creative_id]
+        properties:
+          s3_bucket:
+            type: string
+          s3_key:
+            type: string
+          creative_id:
+            type: string
+          campaign_id:
+            type: string
+
+  # ── Deployment & Stage ────────────────────────────────────────────────────────
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadPostMethod
+      - ScorePostMethod
+      - ScoreGetMethod
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      Description: !Sub "Deployment for ${Environment}"
+
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: APIGatewayAccount
+    Properties:
+      RestApiId: !Ref AdScorerAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      Description: !Sub "${Environment} stage"
+      TracingEnabled: true  # X-Ray active tracing
+      AccessLogSetting:
+        DestinationArn: !GetAtt APIAccessLogGroup.Arn
+        Format: >
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "caller":"$context.identity.caller","user":"$context.identity.user",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "integrationLatency":"$context.integrationLatency"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: !Ref APIThrottleBurstLimit
+          ThrottlingRateLimit: !Ref APIThrottleRateLimit
+          MetricsEnabled: true
+          DataTraceEnabled: false  # Keep false in prod to avoid logging PII
+          LoggingLevel: ERROR
+
+  # ── API Key & Usage Plan (optional, controlled by EnableAPIKey param) ──────────
+  AdScorerAPIKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: RequireAPIKey
+    DependsOn: APIStage
+    Properties:
+      Name: !Sub "${ProjectName}-api-key-${Environment}"
+      Description: API key for Ad Scorer service consumers
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref AdScorerAPI
+          StageName: !Ref Environment
+
+  AdScorerUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: RequireAPIKey
+    DependsOn: APIStage
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-usage-plan-${Environment}"
+      Description: Standard usage plan for Ad Scorer API
+      ApiStages:
+        - ApiId: !Ref AdScorerAPI
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: !Ref APIThrottleBurstLimit
+        RateLimit: !Ref APIThrottleRateLimit
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  APIKeyUsagePlanLink:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: RequireAPIKey
+    Properties:
+      KeyId: !Ref AdScorerAPIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref AdScorerUsagePlan
+
+Conditions:
+  RequireAPIKey: !Equals [!Ref EnableAPIKey, "true"]
+
+Outputs:
+  APIEndpoint:
+    Description: Base URL for the Ad Scorer REST API
+    Value: !Sub "https://${AdScorerAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-APIEndpoint"
+
+  UploadEndpoint:
+    Description: POST endpoint to get presigned S3 upload URL
+    Value: !Sub "https://${AdScorerAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/v1/upload"
+
+  ScoreEndpoint:
+    Description: POST endpoint to submit creative for scoring
+    Value: !Sub "https://${AdScorerAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/v1/score"
+
+  APIKeyId:
+    Condition: RequireAPIKey
+    Description: API Key ID (retrieve value from console or CLI)
+    Value: !Ref AdScorerAPIKey
