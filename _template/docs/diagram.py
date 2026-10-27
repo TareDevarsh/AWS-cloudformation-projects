@@ -4,6 +4,7 @@
     python3 docs/diagram.py   # writes docs/images/architecture.png
 
 Icon catalog: https://diagrams.mingrammer.com/docs/nodes/aws
+Replace the placeholder nodes below with this project's real components.
 """
 from pathlib import Path
 
@@ -16,10 +17,10 @@ from diagrams.onprem.client import User
 OUT = Path(__file__).parent / "images" / "architecture"
 OUT.parent.mkdir(exist_ok=True)
 
-with Diagram("NN · Project Name", filename=str(OUT), show=False,
+with Diagram("{{NN}} · {{Title}}", filename=str(OUT), show=False,
              direction="LR", graph_attr={"pad": "0.4", "fontsize": "20"}):
     client = User("Client\n(SigV4)")
-    with Cluster("AWS · stack <name>-<stage>"):
+    with Cluster("AWS · stack {{slug}}-<stage>"):
         api = APIGateway("API\nAWS_IAM auth")
         fn = Lambda("Function")
         store = Dynamodb("Table")

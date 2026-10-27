@@ -9,6 +9,14 @@ Rules every project follows so the repo reads the same everywhere.
 - `projects/NN-short-name/`. The two-digit number sets reading order (`01-key-value-store`, `02-ad-creative-scorer`).
 - Lowercase, hyphen-separated.
 
+## Creating a project
+
+```bash
+./scripts/new-project.sh <NN> <slug> "<Title>"
+```
+
+This copies `_template/` and replaces the `{{NN}}`, `{{slug}}`, and `{{Title}}` placeholders. The template deploys as-is (one SSM parameter placeholder), so you can test the pipeline before adding real resources.
+
 ## Project layout
 
 This follows the common AWS sample layout (code in `src/`, tests in `tests/`, IaC separate from code), with plain CloudFormation in place of SAM/CDK.
@@ -24,7 +32,7 @@ NN-short-name/
 ├── infrastructure/            ← CloudFormation YAML (one or more stacks)
 ├── src/                       ← Lambda code; one folder per function if >1
 ├── tests/
-│   └── integration/           ← end-to-end tests against a deployed stack
+│   └── integration/           ← end-to-end tests (sigv4.py helper included)
 └── scripts/                   ← deploy.sh, destroy.sh (+ extra ops scripts)
 ```
 

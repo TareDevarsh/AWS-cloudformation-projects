@@ -1,22 +1,26 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: NN-project-name - one-line description.
+Description: "{{NN}}-{{slug}} - replace with a one-line description."
 
 Parameters:
   Stage:
     Type: String
     Default: dev
     AllowedValues: [dev, test, prod]
+    Description: Deployment stage, used in names and tags.
 
 Resources:
-  # Placeholder so the template is deployable; replace with real resources.
+  # Placeholder so the stack deploys before real resources exist. Delete it once you add yours.
+  # Lambda pattern: Code: ../src/<function>/ (packaged by scripts/deploy.sh), plus
+  #   Metadata: { cfn-lint: { config: { ignore_checks: [W3002] } } }
+  # API pattern: AuthorizationType: AWS_IAM on every method + a client ManagedPolicy output.
   PlaceholderParam:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: !Sub /NN-project-name/${Stage}/placeholder
+      Name: !Sub "/{{slug}}/${Stage}/placeholder"
       Type: String
       Value: replace-me
       Tags:
-        Project: NN-project-name
+        Project: "{{NN}}-{{slug}}"
         Stage: !Ref Stage
 
 Outputs:

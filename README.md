@@ -30,7 +30,7 @@ Every entry below is a link, so you can jump straight to the file.
 
 - 📁 **[aws-projects](./)**
   - 📘 [docs/CONVENTIONS.md](docs/CONVENTIONS.md): layout, README order, diagram and security rules
-  - 🧩 [_template/](_template/): copy this to start a new project
+  - 🧩 [_template/](_template/): project skeleton · [scripts/new-project.sh](scripts/new-project.sh) scaffolds from it
   - 📦 **[01 · Key-Value Store](projects/01-key-value-store/)**
     - [Architecture](projects/01-key-value-store/docs/architecture.md) · [Workflows](projects/01-key-value-store/docs/workflow.md)
     - [Template: kv-store.yaml](projects/01-key-value-store/infrastructure/kv-store.yaml) · [Code: handler.py](projects/01-key-value-store/src/handler.py)
@@ -78,7 +78,9 @@ aws-projects/
 ├── README.md                    ← you are here: portfolio summary
 ├── docs/
 │   └── CONVENTIONS.md           ← folder rules, README order, diagram + security standards
-├── _template/                   ← copy to start a new project
+├── _template/                   ← project skeleton with {{NN}} {{slug}} {{Title}} placeholders
+├── scripts/
+│   └── new-project.sh           ← scaffold: ./scripts/new-project.sh 03 slug "Title"
 ├── projects/
 │   ├── 01-key-value-store/
 │   │   ├── README.md            ← summary, diagrams, how to run
@@ -132,7 +134,7 @@ graph TD
 ## Starting a new project
 
 ```bash
-cp -r _template projects/03-<short-name>
+./scripts/new-project.sh 03 url-shortener "URL Shortener"
 ```
 
-Then fill in the README sections, run `python3 docs/diagram.py`, add the project to the table, map, and tree above, and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
+This copies [`_template/`](_template/) to `projects/03-url-shortener/` and fills in the number, slug, and title everywhere. Then build the project, run `python3 docs/diagram.py`, add it to the table, gallery, map, and tree above, and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
