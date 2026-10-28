@@ -22,6 +22,7 @@ The project is built in defined steps. Each step is designed and agreed before i
 | Middleware | One EC2 + Docker Compose: router, one limiter container per language, Redis |
 | Backend | AWS Lambda (stand-in for a real server, keeps testing cheap) |
 | Algorithm | Token bucket (bucket size, refill rate) |
+| Caller identity | User id + cookie + IP, layered: a request needs a token in every bucket ([details](docs/architecture.md#identifying-the-caller)) |
 | Rate limiter placement | Middleware between client and servers |
 | Token buckets | Redis container (Docker network only) |
 | Rules | S3 `rules.yaml`, held in limiter memory, refreshed by ETag |
@@ -72,14 +73,19 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 03-rate-limiter/
 ├── README.md                 ← this file
 ├── docs/
-│   ├── architecture.md       ← components, data model, decisions
+│   ├── architecture.md       ← placement, routing, identity, security, decisions
 │   ├── workflow.md           ← sequence + state diagrams, deploy lifecycle
 │   ├── diagram.py            ← diagram-as-code (AWS icons)
 │   └── images/architecture.png
 ├── infrastructure/
 │   └── template.yaml         ← CloudFormation stack
 ├── src/
-│   └── token_bucket/         ← docker-compose.yml, token_bucket.lua, router/, one folder per language
+│   └── token_bucket/
+│       ├── README.md         ← how the token bucket works, Redis data model, memory sizing
+│       ├── token_bucket.lua  ← the algorithm (runs in Redis)
+│       ├── rules.yaml        ← rate limit rules
+│       ├── docker-compose.yml, router/nginx.conf
+│       └── python/ go/ node/ ← one limiter server per language
 ├── tests/
 │   └── integration/          ← tests against the deployed stack
 └── scripts/
@@ -91,10 +97,13 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 
 ```bash
 cd projects/03-rate-limiter
-./scripts/deploy.sh dev us-east-1
-# python3 tests/integration/<test>.py dev us-east-1
-./scripts/destroy.sh dev us-east-1
+./scripts/deploy.sh dev us-east-1          # uploads code + rules, deploys, waits until all limiters are healthy (~5-15 min)
+# Console: add ONE inbound rule to the SecurityGroupId output: TCP 8080, <your-ip>/32
+python3 tests/integration/latency.py http://<PublicIp>:8080 100
+./scripts/destroy.sh dev us-east-1         # deletes the stack and this stage's uploaded artifacts
 ```
+
+Change only `rules.yaml` and re-run `deploy.sh`: the limiters pick it up within ~30 s without replacing the instance. Changing code replaces the instance (new public IP; your security group rule stays).
 
 ## Cost & security notes
 
@@ -105,4 +114,16 @@ cd projects/03-rate-limiter
 
 ## What I learned / next steps
 
-- [ ] Steps to be added as we go
+Done:
+
+- [x] Token bucket algorithm (Lua, multi-bucket, all-or-nothing) — [details](src/token_bucket/README.md)
+- [x] Limiter servers: Python (tested locally), Node (logic tested), Go (first build on EC2)
+- [x] nginx router + Docker Compose (Redis with password, one published port)
+- [x] CloudFormation: VPC, EC2 t4g.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean)
+- [x] `deploy.sh` / `destroy.sh` and the live test `tests/integration/latency.py`
+
+Left to build:
+
+- [ ] Deploy, add owner IP, run tests, fill in the Latency table
+- [ ] Update `docs/diagram.py` + render `architecture.png`, `docs/workflow.md`
+- [ ] Phase 2: scale out (more instances, ElastiCache), more algorithms

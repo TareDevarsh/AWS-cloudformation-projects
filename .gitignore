@@ -33,3 +33,6 @@ packaged*.yaml
 *credentials*
 *.tfstate*
 samconfig.toml
+
+# Node dependencies
+node_modules/

@@ -15,15 +15,6 @@ flowchart TB
 |------------|------|---------|
 | | | |
 
-## Data model
-
-```mermaid
-erDiagram
-    ITEM {
-        string pk PK "describe"
-    }
-```
-
 ## Where the rate limiter sits
 
 We considered three places for the rate limiter.
@@ -101,33 +92,66 @@ flowchart TB
 | EC2 | One small ARM instance running Docker Compose. Deleted after each test | Yes |
 | Router | nginx container. Single published port (8080). Routes `/python/...`, `/go/...`, `/node/...` to the matching limiter container | Yes, small fixed hop |
 | Rate limiter (per language) | Matches the request to a rule (in memory), takes a token from Redis, forwards or rejects | Yes |
-| Redis | Holds the live token count per bucket. Docker network only, never published | Yes, one round trip |
+| Redis | Holds the live token count per bucket ([data model](../src/token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |
 | S3 | Source of truth for the rules (`rules.yaml`) | No |
 | Backend | Lambda stand-in for a real server. Called with the EC2 instance role (SigV4). Only sees allowed requests | Only when allowed |
 
+Rule format and the example rules: [token bucket README](../src/token_bucket/README.md#rules).
+
 Why not Lambda for the middleware: the real middleware is a long-running server. Lambda adds cold starts, has no shared memory between copies, and needs a VPC to reach Redis, so its numbers would mostly measure Lambda.
 
-### Rate limit rules (proposed shape)
+## Identifying the caller
 
-One rule per thing we limit. Each token bucket rule has the two variables: bucket size and refill rate.
+### Possible identifiers
 
-```yaml
-rules:
-  - id: default-per-user
-    match:
-      key: user_id          # what identifies the caller (user id, API key, IP)
-      path: "*"             # which endpoint(s) the rule covers
-    bucket_size: 10         # max tokens = max burst
-    refill_rate: 5          # tokens added per second
-  - id: login-per-ip
-    match:
-      key: ip
-      path: /login
-    bucket_size: 5
-    refill_rate: 0.1        # 1 token every 10 s
+| Identifier | Where it comes from | Can the caller fake it? | Good for |
+|------------|---------------------|-------------------------|----------|
+| User id (authenticated) | Verified token (e.g. JWT `sub`) | No | Per-user fairness; most accurate |
+| API key / client id | Header, checked against issued keys | No, once checked | Public APIs, partners, paid tiers |
+| Account / tenant / org | Looked up from the user | No | One shared limit per company |
+| IP address | Network connection | Hard to fake, but shared and changing | Anonymous traffic, login/sign-up |
+| IP range (IPv4 /24, IPv6 /64) | Derived from the IP | Hard to fake | Attackers rotating nearby IPs |
+| Session / cookie id | Cookie | Yes: clear it, get a new one | Logged-out website visitors |
+| Device id | Mobile app install id | Yes: reinstall | Mobile apps |
+| Global (no caller) | Nothing | n/a | Capping total backend load |
+
+Watch-outs:
+
+- Raw headers (`X-User-Id`, `X-Forwarded-For`) can be set to anything by the client. Trust only verified ids, or the IP our own nginx records.
+- One IP can hide thousands of users (office, school, mobile carrier), so IP limits should be looser.
+- Device fingerprinting (identifying users from browser/device traits without consent) is avoided: it is a privacy problem.
+
+### Chosen: user id + cookie + IP, layered
+
+Every request is checked against **several buckets at once**, and is allowed only if **all** of them have a token.
+
+| Layer | Applies when | Key | Stops |
+|-------|--------------|-----|-------|
+| User id | Request has a user id | `user-u42` | One user overusing the API |
+| Cookie | No user id, but has a session cookie | `cookie-u9f2c1a` | Logged-out visitors overusing it |
+| IP | Always | `ip-u3405803783` | Anyone dodging the other layers (no id, clearing cookies), and floods from one address |
+
+```mermaid
+flowchart TB
+    Req[Request] --> HasUser{User id?}
+    HasUser -- yes --> U[check user-u&lt;id&gt;]
+    HasUser -- no --> HasCookie{Cookie?}
+    HasCookie -- yes --> C[check cookie-u&lt;session&gt;]
+    HasCookie -- no --> None[no identity bucket]
+    U & C & None --> IP[check ip-u&lt;ip&gt;]
+    IP --> All{All buckets<br/>had a token?}
+    All -- yes --> Allow[Forward to backend]
+    All -- no --> Deny[429]
 ```
 
-Decided: a rule matches on both the caller (`key`) and the endpoint (`path`).
+Why layered and not one combined key (e.g. user + cookie + IP in one key): a combined key changes whenever any part changes, so clearing a cookie or switching networks would give the caller a fresh, full bucket. Separate layers mean the IP bucket still holds even when the cookie is reset.
+
+Test-only shortcuts (fine here, not for real use):
+
+- The user id comes from an `X-User-Id` header, which a caller can fake. In real use it would come from a verified login token.
+- The cookie is a random session id the client sends; we don't issue or sign it.
+
+Checking several buckets is all-or-nothing: if the IP bucket denies, the user bucket doesn't lose a token. The Lua script checks every bucket in one Redis call ([details](../src/token_bucket/README.md#the-lua-script)).
 
 ### Where the rules are stored
 
@@ -149,33 +173,25 @@ One folder per algorithm. Each has a Compose file that starts the router, one li
 ```text
 src/
 └── token_bucket/
+    ├── README.md            ← how the token bucket works, data model, memory sizing
     ├── docker-compose.yml   ← router + one limiter per language + Redis
-    ├── token_bucket.lua     ← the algorithm (runs atomically in Redis)
-    ├── router/              ← routes /python, /go, /node
-    ├── python/Dockerfile
-    ├── go/Dockerfile
-    └── node/Dockerfile
+    ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
+    ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
+    ├── router/nginx.conf    ← nginx: routes /python, /go, /node
+    ├── python/              ← app.py, requirements.txt, Dockerfile
+    ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
+    └── node/                ← server.js, package.json, package-lock.json, Dockerfile
 ```
 
 Only source files and Dockerfiles go to GitHub (each Dockerfile is ~10-20 lines). Images are built on the EC2 instance and never committed.
 
-## Token bucket
+## Algorithms
 
-Each bucket holds up to **bucket size** tokens and gains tokens at the **refill rate**. Every request takes one token. No token, no entry.
+Each algorithm lives in its own folder under `src/` with its own README (how it works, Redis data model, memory sizing). The rest of this page (placement, routing, identity, rules storage, security) is shared by all algorithms.
 
-```mermaid
-flowchart LR
-    Refill["Refill<br/>+refill_rate tokens/s"] --> Bucket[("Bucket<br/>max = bucket_size")]
-    Bucket -. "full: extra tokens dropped" .-> Drop[Overflow]
-    Req[Request] --> Check{Token left?}
-    Bucket --- Check
-    Check -- "yes: take 1" --> Allow[Forward to backend]
-    Check -- "no" --> Deny[429 Too Many Requests]
-```
-
-- **Bucket size** sets the largest burst allowed at once.
-- **Refill rate** sets the steady rate allowed over time.
-- Example: size 10, rate 5/s. A caller can send 10 requests at once, then about 5 per second after that.
+| Algorithm | In short | Details |
+|-----------|----------|---------|
+| Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. Runs as one atomic Lua script in Redis. | [src/token_bucket/README.md](../src/token_bucket/README.md) |
 
 ## Latency measurement
 
@@ -217,6 +233,9 @@ Parked: fail open vs fail closed.
 | Middleware compute (phase 1) | One EC2 + Docker Compose | Lambda | Behaves like the real long-running server; no cold starts or VPC complexity |
 | Lambda middleware | Rejected | Concurrency 1, normal concurrency | Cold starts, no shared memory, throttling at concurrency 1; measures Lambda, not the limiter |
 | Counter store | Redis container on the same EC2 | ElastiCache | Cheapest for phase 1; ElastiCache in phase 2 |
+| Redis key | `<rule>-u<caller>`, e.g. `user-u42`; IPv4 stored as a number | `tb:default-per-user:user42` | Shorter key = less memory per user; same lookup speed |
+| Token storage | Whole milli-tokens (1 token = 1000), fields `t` and `ts` | Fractional tokens as text | Compact integer storage, no floating-point drift |
+| Caller identity | User id + cookie + IP, layered: allow only if every bucket has a token | One combined key; IP only; API keys | Resetting one id (e.g. clearing cookies) still hits the IP bucket |
 | Rule match | Caller + endpoint | Caller only, endpoint only | Different limits per endpoint for each caller |
 | Rules store | S3 YAML, in limiter memory, refreshed by ETag | DynamoDB, AppConfig, EFS/EBS, Redis | Cheapest, versioned, memory-speed reads |
 | Rule loading | Poll S3 with ETag | Loader Lambda push, pull on miss | No extra Lambda; a long-running server can poll cheaply |

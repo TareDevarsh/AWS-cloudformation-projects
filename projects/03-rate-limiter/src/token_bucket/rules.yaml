@@ -1,0 +1,36 @@
+# Rate limit rules for the token bucket limiter.
+# Uploaded to S3 on deploy; every limiter keeps a copy in memory and
+# re-reads it only when the S3 ETag changes.
+#
+# id          short name, lowercase letters/digits only. Used in the Redis key:
+#             "<id>-u<caller>", e.g. user-u42
+# match.key   who the bucket is for:
+#               user_id  X-User-Id header (test only: callers can fake it)
+#               cookie   "session" cookie, used only when there is no user id
+#               ip       client IP as seen by nginx (always checked)
+# match.path  "*" = every path, "/x" = exactly /x, "/x/*" = /x and below.
+#             Path is after the language prefix (/python/login -> /login).
+# bucket_size max tokens = max burst
+# refill_rate tokens added per second (can be fractional)
+# cost        tokens per request (optional, default 1)
+
+rules:
+  - id: user
+    match: { key: user_id, path: "*" }
+    bucket_size: 10
+    refill_rate: 5
+
+  - id: cookie
+    match: { key: cookie, path: "*" }
+    bucket_size: 5
+    refill_rate: 2
+
+  - id: ip
+    match: { key: ip, path: "*" }
+    bucket_size: 20      # looser: many users can share one IP
+    refill_rate: 10
+
+  - id: login
+    match: { key: ip, path: /login }
+    bucket_size: 5
+    refill_rate: 0.1     # 1 token every 10 s
