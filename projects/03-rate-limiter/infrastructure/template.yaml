@@ -352,11 +352,11 @@ Outputs:
   # The instance's public address.
   PublicIp:
     Description: Instance public IP. # shown in the console
-    Value: !GetAtt Instance.PublicIp # e.g. 3.120.1.2
+    Value: !GetAtt Instance.PublicIp # e.g. 203.0.113.10
   # The URL to test against.
   Endpoint:
     Description: Router base URL (reachable only after you add your IP to the security group). # shown in the console
-    Value: !Sub "http://${Instance.PublicIp}:8080" # e.g. http://3.120.1.2:8080
+    Value: !Sub "http://${Instance.PublicIp}:8080" # e.g. http://203.0.113.10:8080
   # Which security group to add your IP to.
   SecurityGroupId:
     Description: Add an inbound rule here for YOUR IP only (TCP 8080, x.x.x.x/32). # shown in the console

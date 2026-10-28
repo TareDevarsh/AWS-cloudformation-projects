@@ -191,7 +191,7 @@ function callerIds(req) {
   // port, so only nginx can reach it and the header can be trusted here.
   // Fallback: the direct peer address (local testing without nginx).
   const ipText = String(req.headers["x-real-ip"] || req.socket.remoteAddress || "").trim()
-    .replace(/^::ffff:/, ""); // Node shows IPv4 peers as "::ffff:1.2.3.4"
+    .replace(/^::ffff:/, ""); // Node shows IPv4 peers as "::ffff:192.0.2.4"
   let ip;
   if (net.isIPv4(ipText)) {
     // IPv4 -> number (203.0.113.7 -> 3405803783). ">>> 0" keeps it unsigned.
