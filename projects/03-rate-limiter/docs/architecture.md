@@ -174,6 +174,7 @@ One folder per algorithm. Each has a Compose file that starts the router, one li
 src/
 └── token_bucket/
     ├── README.md            ← how the token bucket works, data model, memory sizing
+    ├── CODE_STRUCTURE.md    ← Merkle-tree map of these files and what each does
     ├── docker-compose.yml   ← router + one limiter per language + Redis
     ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
     ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
@@ -182,6 +183,8 @@ src/
     ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
     └── node/                ← server.js, package.json, package-lock.json, Dockerfile
 ```
+
+Diagram of every file and what it does: [src/token_bucket/CODE_STRUCTURE.md](../src/token_bucket/CODE_STRUCTURE.md).
 
 Only source files and Dockerfiles go to GitHub (each Dockerfile is ~10-20 lines). Images are built on the EC2 instance and never committed.
 

@@ -1,6 +1,6 @@
 # Token bucket
 
-[← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Lua script](token_bucket.lua) · [Rules](rules.yaml)
+[← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Lua script](token_bucket.lua) · [Rules](rules.yaml) · [Code structure](CODE_STRUCTURE.md)
 
 The first rate limiting algorithm in this project. Every language server (Python, Go, Node) uses the same Lua script inside Redis, so the algorithm is identical and only the server wrapper differs.
 
@@ -174,6 +174,7 @@ A caller uses ~2 buckets, not 4: `user` or `cookie` (never both) + `ip`, plus `l
 ```text
 token_bucket/
 ├── README.md            ← this file
+├── CODE_STRUCTURE.md    ← Merkle-tree map of these files
 ├── token_bucket.lua     ← the algorithm (runs in Redis)
 ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
 ├── docker-compose.yml   ← router + 3 limiters + Redis
