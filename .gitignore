@@ -36,3 +36,15 @@ samconfig.toml
 
 # Node dependencies
 node_modules/
+
+# Kiro: only publish the project steering file (settings may hold tokens)
+.kiro/*
+!.kiro/steering/
+.kiro/steering/*
+!.kiro/steering/project-conventions.md
+
+# More secret patterns
+.env.*
+id_rsa*
+*.p12
+cdk.out/
