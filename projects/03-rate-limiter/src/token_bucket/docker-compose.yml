@@ -3,7 +3,7 @@
 # Run from src/token_bucket/:
 #   docker compose up -d --build
 #
-# Needs a .env file next to this one (never committed; deploy creates it):
+# Needs a .env file next to this one (never committed; the EC2 boot script creates it):
 #   REDIS_PASSWORD=<random hex>         required
 #   RULES_BUCKET=<s3 bucket>            optional; empty = use baked-in rules.yaml
 #   RULES_KEY=<s3 key>                  key of rules.yaml in that bucket
@@ -13,94 +13,88 @@
 # Only the router publishes a port. Everything else talks over the private
 # "internal" Docker network and is unreachable from outside the EC2.
 
+# The containers to run.
 services:
   # --- Router: the only public entry point ----------------------------------
   router:
-    # Official nginx, stable branch, small Alpine base.
-    image: nginx:1.30.6-alpine
-    # Our routing config, read-only.
+    image: nginx:1.30.6-alpine # official nginx, stable branch, small Alpine base
     volumes:
-      - ./router/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./router/nginx.conf:/etc/nginx/nginx.conf:ro # our routing config, read-only
     # Port 8080 on the EC2 -> 8080 in the container. This is the ONE published
     # port. It binds all interfaces on purpose: the EC2 security group is the
     # gate and allows only the owner's IP (added by hand after deploy).
     ports:
-      - "8080:8080"
-    # Start after the limiters exist.
-    depends_on: [limiter-python, limiter-go, limiter-node]
-    networks: [internal]
-    restart: unless-stopped
+      - "8080:8080" # host:container
+    depends_on: [limiter-python, limiter-go, limiter-node] # start after the limiters exist
+    networks: [internal] # join the private network
+    restart: unless-stopped # restart on crash or reboot
 
   # --- Limiters: same algorithm, three languages ----------------------------
   limiter-python:
-    # Built from python/Dockerfile with src/token_bucket/ as context.
-    build: { context: ., dockerfile: python/Dockerfile }
+    build: { context: ., dockerfile: python/Dockerfile } # build from src/token_bucket/ (so it can copy the .lua)
     environment:
-      # Password from .env; compose refuses to start if it's missing.
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
-      PATH_PREFIX: /python
-      RULES_BUCKET: ${RULES_BUCKET:-}
-      RULES_KEY: ${RULES_KEY:-rules.yaml}
-      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-}
-      AWS_REGION: ${AWS_REGION:-}
-      AWS_DEFAULT_REGION: ${AWS_REGION:-}
-    # No "ports:" = not reachable from outside the EC2.
-    depends_on: { redis: { condition: service_healthy } }
-    networks: [internal]
-    restart: unless-stopped
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env; refuses to start if missing
+      PATH_PREFIX: /python # prefix nginx routes on; stripped before rule matching
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules (empty = local file)
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda (empty = echo)
+      AWS_REGION: ${AWS_REGION:-} # region for S3/Lambda calls
+      AWS_DEFAULT_REGION: ${AWS_REGION:-} # boto3 also reads this name
+    depends_on: { redis: { condition: service_healthy } } # wait until Redis answers PING
+    networks: [internal] # private network only; no "ports:" = unreachable from outside
+    restart: unless-stopped # restart on crash or reboot
 
   limiter-go:
-    build: { context: ., dockerfile: go/Dockerfile }
+    build: { context: ., dockerfile: go/Dockerfile } # build from src/token_bucket/
     environment:
-      REDIS_ADDR: redis:6379
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
-      PATH_PREFIX: /go
-      RULES_BUCKET: ${RULES_BUCKET:-}
-      RULES_KEY: ${RULES_KEY:-rules.yaml}
-      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-}
-      AWS_REGION: ${AWS_REGION:-}
-    depends_on: { redis: { condition: service_healthy } }
-    networks: [internal]
-    restart: unless-stopped
+      REDIS_ADDR: redis:6379 # Redis service name + port on the private network
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} # password from .env
+      PATH_PREFIX: /go # prefix nginx routes on
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda
+      AWS_REGION: ${AWS_REGION:-} # region for S3/Lambda calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
 
   limiter-node:
-    build: { context: ., dockerfile: node/Dockerfile }
+    build: { context: ., dockerfile: node/Dockerfile } # build from src/token_bucket/
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
-      PATH_PREFIX: /node
-      RULES_BUCKET: ${RULES_BUCKET:-}
-      RULES_KEY: ${RULES_KEY:-rules.yaml}
-      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-}
-      AWS_REGION: ${AWS_REGION:-}
-    depends_on: { redis: { condition: service_healthy } }
-    networks: [internal]
-    restart: unless-stopped
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env
+      PATH_PREFIX: /node # prefix nginx routes on
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda
+      AWS_REGION: ${AWS_REGION:-} # region for S3/Lambda calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
 
   # --- Redis: token buckets only --------------------------------------------
   redis:
-    image: redis:8.10.3-alpine
+    image: redis:8.10.3-alpine # official Redis, small Alpine base
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
-    # --requirepass   password required for every client
-    # --save ""       no snapshots to disk: buckets are short-lived anyway
-    # --appendonly no no write log either
-    # --maxmemory     cap memory on the small EC2
-    # --maxmemory-policy volatile-ttl  if full, evict buckets closest to expiry
-    #   (an evicted bucket just starts full again)
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} # used by the command and healthcheck below
+    # Start Redis with:
+    #   --requirepass       password required for every client
+    #   --save ""           no snapshots to disk (buckets are short-lived anyway)
+    #   --appendonly no     no write log either
+    #   --maxmemory 128mb   cap memory on the small EC2
+    #   --maxmemory-policy volatile-ttl  if full, drop buckets closest to expiry
+    #                                    (a dropped bucket just starts full again)
     command:
-      - sh
-      - -c
-      - exec redis-server --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no --maxmemory 128mb --maxmemory-policy volatile-ttl
-    # Healthy = answers PING with the password. Limiters wait for this.
+      - sh # run through a shell...
+      - -c # ...so $REDIS_PASSWORD is read from the environment, not written here
+      - exec redis-server --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no --maxmemory 128mb --maxmemory-policy volatile-ttl # $$ = literal $ for the shell
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    # No "ports:" = never reachable from outside the EC2.
-    networks: [internal]
-    restart: unless-stopped
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"] # healthy = answers PING with the password
+      interval: 5s # check every 5 s
+      timeout: 3s # each check may take 3 s
+      retries: 10 # unhealthy after 10 failures in a row
+    networks: [internal] # private network only; never published
+    restart: unless-stopped # restart on crash or reboot
 
+# Networks used above.
 networks:
-  # Private network shared by all services; Docker's DNS resolves service names.
-  internal: {}
+  internal: {} # private network shared by all services; Docker's DNS resolves service names

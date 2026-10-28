@@ -119,7 +119,7 @@ Done:
 - [x] Token bucket algorithm (Lua, multi-bucket, all-or-nothing) — [details](src/token_bucket/README.md)
 - [x] Limiter servers: Python (tested locally), Node (logic tested), Go (first build on EC2)
 - [x] nginx router + Docker Compose (Redis with password, one published port)
-- [x] CloudFormation: VPC, EC2 t4g.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean)
+- [x] CloudFormation: VPC, EC2 t3.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean)
 - [x] `deploy.sh` / `destroy.sh` and the live test `tests/integration/latency.py`
 
 Left to build:

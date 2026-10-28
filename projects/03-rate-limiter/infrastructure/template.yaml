@@ -1,4 +1,6 @@
+# CloudFormation template format version (the only valid value).
 AWSTemplateFormatVersion: "2010-09-09"
+# Shown in the CloudFormation console for this stack.
 Description: >-
   03-rate-limiter: one EC2 running nginx + token bucket limiters (Python, Go,
   Node) + Redis in Docker Compose, in front of a Lambda backend. Short-lived
@@ -12,283 +14,314 @@ Description: >-
 #   3. The security group starts with NO inbound rules. The owner adds their
 #      own IP (TCP 8080) by hand in the console; it is never stored in git.
 
+# Inputs chosen at deploy time.
 Parameters:
+  # Environment name, used in resource names and tags.
   Stage:
-    Type: String
-    Default: dev
-    AllowedValues: [dev, test, prod]
+    Type: String # free text...
+    Default: dev # ...dev unless told otherwise...
+    AllowedValues: [dev, test, prod] # ...but only one of these
     Description: Deployment stage, used in names and tags.
 
+  # Size of the EC2 instance.
   InstanceType:
-    Type: String
-    Default: t4g.small
-    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
-    Description: Small ARM instance. t4g.small (2 vCPU, 2 GB) fits nginx + 3 limiters + Redis.
+    Type: String # instance type name
+    Default: t3.small # 2 vCPU, 2 GB RAM, x86 (t4g/ARM isn't allowed in this account)
+    AllowedValues: [t3.micro, t3.small, t3.medium] # small x86 sizes only, to keep cost down
+    Description: Small x86 instance. t3.small (2 vCPU, 2 GB) fits nginx + 3 limiters + Redis.
 
+  # Operating system image.
   AmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    Description: Latest Amazon Linux 2023 ARM AMI, resolved at deploy time.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id> # read the AMI id from a public SSM parameter
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 # always the newest Amazon Linux 2023 for x86 (matches t3)
+    Description: Latest Amazon Linux 2023 x86_64 AMI, resolved at deploy time.
 
+  # Where deploy.sh uploaded the code and rules.
   ArtifactBucket:
-    Type: String
+    Type: String # bucket name, e.g. cfn-artifacts-<account>-<region>
     Description: Private artifact bucket holding the code zip and rules (created by deploy.sh).
 
+  # Path of the code zip in that bucket.
   AppKey:
-    Type: String
+    Type: String # e.g. 03-rate-limiter/dev/app-2ab65465ccd0.zip
     Description: S3 key of the code zip. Includes a content hash, so code changes replace the instance.
 
+  # Path of rules.yaml in that bucket.
   RulesKey:
-    Type: String
+    Type: String # e.g. 03-rate-limiter/dev/rules.yaml
     Description: S3 key of rules.yaml. Limiters re-read it when its ETag changes.
 
+# Everything this stack creates.
 Resources:
   # ---------------------------------------------------------------------------
   # Network: a small VPC with one public subnet.
   # ---------------------------------------------------------------------------
+
+  # Private network for this project only.
   Vpc:
-    Type: AWS::EC2::VPC
+    Type: AWS::EC2::VPC # a virtual network
     Properties:
-      CidrBlock: 10.30.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
+      CidrBlock: 10.30.0.0/16 # private address range (65k addresses)
+      EnableDnsSupport: true # instances can resolve DNS names (needed for S3, Lambda, GitHub)
+      EnableDnsHostnames: true # instances get DNS hostnames
       Tags:
-        - { Key: Name, Value: !Sub "rate-limiter-${Stage}" }
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Name, Value: !Sub "rate-limiter-${Stage}" } # name shown in the console
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # Door between the VPC and the internet.
   InternetGateway:
-    Type: AWS::EC2::InternetGateway
+    Type: AWS::EC2::InternetGateway # managed by AWS, no size or cost per hour
     Properties:
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # Plug the internet gateway into our VPC.
   GatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
+    Type: AWS::EC2::VPCGatewayAttachment # links one gateway to one VPC
     Properties:
-      VpcId: !Ref Vpc
-      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc # our VPC
+      InternetGatewayId: !Ref InternetGateway # our gateway
 
+  # The one subnet the instance lives in.
   PublicSubnet:
-    Type: AWS::EC2::Subnet
+    Type: AWS::EC2::Subnet # a slice of the VPC in one availability zone
     Properties:
-      VpcId: !Ref Vpc
-      CidrBlock: 10.30.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs ""]
-      # The instance gets a public IP so the owner can call it directly.
-      MapPublicIpOnLaunch: true
+      VpcId: !Ref Vpc # inside our VPC
+      CidrBlock: 10.30.1.0/24 # 256 addresses
+      AvailabilityZone: !Select [0, !GetAZs ""] # first availability zone of the region
+      MapPublicIpOnLaunch: true # instance gets a public IP so the owner can call it directly
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # Routing rules for the subnet.
   PublicRouteTable:
-    Type: AWS::EC2::RouteTable
+    Type: AWS::EC2::RouteTable # list of "traffic to X goes via Y"
     Properties:
-      VpcId: !Ref Vpc
+      VpcId: !Ref Vpc # belongs to our VPC
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # "Anything not in the VPC goes out through the internet gateway."
   DefaultRoute:
-    Type: AWS::EC2::Route
-    DependsOn: GatewayAttachment
+    Type: AWS::EC2::Route # one entry in the route table
+    DependsOn: GatewayAttachment # the gateway must be attached first
     Properties:
-      RouteTableId: !Ref PublicRouteTable
+      RouteTableId: !Ref PublicRouteTable # add it to our route table
       DestinationCidrBlock: "0.0.0.0/0" # outbound internet route (not an ingress rule)
-      GatewayId: !Ref InternetGateway
+      GatewayId: !Ref InternetGateway # send it through the gateway
 
+  # Use that route table for our subnet.
   SubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation # links a subnet to a route table
     Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet # our subnet
+      RouteTableId: !Ref PublicRouteTable # our route table
 
-  # NO inbound rules on purpose. The owner adds their own IP for TCP 8080 by
-  # hand after deploy (see Outputs). Outbound uses the AWS default (all), which
-  # the instance needs for Docker images, S3 and Lambda.
+  # Firewall for the instance. NO inbound rules on purpose: the owner adds
+  # their own IP for TCP 8080 by hand after deploy (see Outputs). Outbound uses
+  # the AWS default (all), needed for Docker images, S3 and Lambda.
   InstanceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+    Type: AWS::EC2::SecurityGroup # stateful firewall attached to the instance
     Properties:
-      GroupDescription: Rate limiter router. Inbound is added by hand (owner IP, TCP 8080 only).
-      VpcId: !Ref Vpc
+      GroupDescription: Rate limiter router. Inbound is added by hand (owner IP, TCP 8080 only). # shown in the console
+      VpcId: !Ref Vpc # belongs to our VPC
       Tags:
-        - { Key: Name, Value: !Sub "rate-limiter-${Stage}-router" }
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Name, Value: !Sub "rate-limiter-${Stage}-router" } # easy to find in the console
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
   # ---------------------------------------------------------------------------
   # Backend: Lambda stand-in for a real server.
   # ---------------------------------------------------------------------------
+
+  # Permissions the backend Lambda runs with.
   BackendRole:
-    Type: AWS::IAM::Role
+    Type: AWS::IAM::Role # an identity AWS services can assume
     Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+      AssumeRolePolicyDocument: # who may use this role
+        Version: "2012-10-17" # IAM policy language version
         Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: logs
+          - Effect: Allow # allow...
+            Principal: { Service: lambda.amazonaws.com } # ...the Lambda service...
+            Action: sts:AssumeRole # ...to take on this role
+      Policies: # what the role may do
+        - PolicyName: logs # inline policy name
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: "2012-10-17" # IAM policy language version
             Statement:
-              # Write only to this function's own log group.
-              - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !GetAtt BackendLogGroup.Arn
+              - Effect: Allow # allow...
+                Action: [logs:CreateLogStream, logs:PutLogEvents] # ...writing logs...
+                Resource: !GetAtt BackendLogGroup.Arn # ...only to this function's own log group
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # Where the backend's logs go.
   BackendLogGroup:
-    Type: AWS::Logs::LogGroup
+    Type: AWS::Logs::LogGroup # CloudWatch Logs group
     Properties:
-      LogGroupName: !Sub "/aws/lambda/rate-limiter-${Stage}-backend"
-      RetentionInDays: 7
+      LogGroupName: !Sub "/aws/lambda/rate-limiter-${Stage}-backend" # standard Lambda log group name
+      RetentionInDays: 7 # delete logs after a week (cost)
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # The backend itself (src/backend/handler.py).
   BackendFunction:
-    Type: AWS::Lambda::Function
+    Type: AWS::Lambda::Function # a Lambda function
     Metadata:
-      cfn-lint: { config: { ignore_checks: [W3002] } }
+      cfn-lint: { config: { ignore_checks: [W3002] } } # local Code path is fine: deploy.sh packages it
     Properties:
-      FunctionName: !Sub "rate-limiter-${Stage}-backend"
-      Runtime: python3.13
-      Architectures: [arm64]
-      Handler: handler.handler
-      Code: ../src/backend/
-      MemorySize: 128
-      Timeout: 5
-      Role: !GetAtt BackendRole.Arn
+      FunctionName: !Sub "rate-limiter-${Stage}-backend" # fixed name, easy to find
+      Runtime: python3.13 # Python version
+      Architectures: [arm64] # ARM: cheaper per ms
+      Handler: handler.handler # file handler.py, function handler()
+      Code: ../src/backend/ # uploaded to S3 by "aws cloudformation package"
+      MemorySize: 128 # smallest size; it only echoes
+      Timeout: 5 # seconds before Lambda gives up
+      Role: !GetAtt BackendRole.Arn # run with the role above
       LoggingConfig:
-        LogGroup: !Ref BackendLogGroup
+        LogGroup: !Ref BackendLogGroup # log to the group above (7-day retention)
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
   # ---------------------------------------------------------------------------
   # EC2: role, launch template, instance.
   # ---------------------------------------------------------------------------
+
+  # Permissions the EC2 instance (and its containers) run with.
   InstanceRole:
-    Type: AWS::IAM::Role
+    Type: AWS::IAM::Role # an identity AWS services can assume
     Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+      AssumeRolePolicyDocument: # who may use this role
+        Version: "2012-10-17" # IAM policy language version
         Statement:
-          - Effect: Allow
-            Principal: { Service: ec2.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        # Shell access through SSM Session Manager (no SSH, no port 22).
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
-      Policies:
-        - PolicyName: rate-limiter
+          - Effect: Allow # allow...
+            Principal: { Service: ec2.amazonaws.com } # ...the EC2 service...
+            Action: sts:AssumeRole # ...to take on this role
+      ManagedPolicyArns: # AWS-managed policies
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore" # shell via SSM Session Manager (no SSH, no port 22)
+      Policies: # our own inline policy
+        - PolicyName: rate-limiter # inline policy name
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: "2012-10-17" # IAM policy language version
             Statement:
-              # Read exactly two objects: the code zip and rules.yaml.
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AppKey}"
-                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RulesKey}"
-              # Call the backend, and nothing else.
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt BackendFunction.Arn
+              - Effect: Allow # allow...
+                Action: s3:GetObject # ...reading objects...
+                Resource: # ...but only these two:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AppKey}" # the code zip
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RulesKey}" # rules.yaml
+              - Effect: Allow # allow...
+                Action: lambda:InvokeFunction # ...calling a Lambda...
+                Resource: !GetAtt BackendFunction.Arn # ...only the backend
       Tags:
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # Wrapper that lets an EC2 instance use the role.
   InstanceProfile:
-    Type: AWS::IAM::InstanceProfile
+    Type: AWS::IAM::InstanceProfile # EC2 needs a profile, not the role directly
     Properties:
-      Roles: [!Ref InstanceRole]
+      Roles: [!Ref InstanceRole] # the role above
 
+  # Instance settings that AWS::EC2::Instance can't set directly.
   LaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
+    Type: AWS::EC2::LaunchTemplate # reusable instance settings
     Properties:
       LaunchTemplateData:
-        # IMDSv2 only. Hop limit 2 so containers (one network hop further)
-        # can get the instance role credentials for S3 and Lambda.
-        MetadataOptions:
-          HttpTokens: required
-          HttpPutResponseHopLimit: 2
-        # Encrypted root disk, room for Docker images.
-        BlockDeviceMappings:
-          - DeviceName: /dev/xvda
+        MetadataOptions: # instance metadata service (where role credentials come from)
+          HttpTokens: required # IMDSv2 only (blocks the older, weaker IMDSv1)
+          HttpPutResponseHopLimit: 2 # containers are one network hop further; 1 would block their credentials
+        BlockDeviceMappings: # disks
+          - DeviceName: /dev/xvda # root disk
             Ebs:
-              VolumeSize: 20
-              VolumeType: gp3
-              Encrypted: true
-              DeleteOnTermination: true
+              VolumeSize: 20 # GB; room for 5 Docker images
+              VolumeType: gp3 # current general-purpose SSD
+              Encrypted: true # encryption at rest
+              DeleteOnTermination: true # deleted with the instance
         TagSpecifications:
-          - ResourceType: volume
+          - ResourceType: volume # tag the disk too
             Tags:
-              - { Key: Project, Value: "03-rate-limiter" }
-              - { Key: Stage, Value: !Ref Stage }
+              - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+              - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
+  # The server running everything.
   Instance:
-    Type: AWS::EC2::Instance
-    # Stack waits until the instance reports that all limiters are healthy.
-    CreationPolicy:
+    Type: AWS::EC2::Instance # one EC2 virtual machine
+    CreationPolicy: # don't mark the stack done when the VM starts...
       ResourceSignal:
-        Timeout: PT25M
+        Timeout: PT25M # ...wait up to 25 min for the boot script's "healthy" signal
     Properties:
-      ImageId: !Ref AmiId
-      InstanceType: !Ref InstanceType
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: [!Ref InstanceSecurityGroup]
-      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref AmiId # Amazon Linux 2023 x86_64
+      InstanceType: !Ref InstanceType # t3.small by default
+      SubnetId: !Ref PublicSubnet # our public subnet (gets a public IP)
+      SecurityGroupIds: [!Ref InstanceSecurityGroup] # our firewall (no inbound until you add your IP)
+      IamInstanceProfile: !Ref InstanceProfile # the role above, for S3 and Lambda
       LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplate
-        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+        LaunchTemplateId: !Ref LaunchTemplate # IMDSv2 + encrypted disk settings
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber # always the newest version
       Tags:
-        - { Key: Name, Value: !Sub "rate-limiter-${Stage}" }
-        - { Key: Project, Value: "03-rate-limiter" }
-        - { Key: Stage, Value: !Ref Stage }
+        - { Key: Name, Value: !Sub "rate-limiter-${Stage}" } # name shown in the console
+        - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+        - { Key: Stage, Value: !Ref Stage } # repo tag convention
+      # Boot script, run once as root on first start. !Sub fills in ${...} values.
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          # Boot script: install Docker, fetch code, start the stack, signal CloudFormation.
+          # Stop on any error, print each command, fail on errors inside pipes.
           set -euxo pipefail
+          # Copy all output to a log file (read it via SSM if boot fails).
           exec > >(tee /var/log/rate-limiter-setup.log) 2>&1
 
-          # Tell CloudFormation whether setup worked (runs on any exit).
+          # Function: tell CloudFormation whether setup worked (0 = ok, 1 = failed).
           signal() {
             /opt/aws/bin/cfn-signal -e "$1" --region ${AWS::Region} \
               --stack ${AWS::StackName} --resource Instance || true
           }
+          # On any error, report failure so the stack rolls back instead of waiting 25 min.
           trap 'signal 1' ERR
 
-          # Docker engine + CloudFormation helper scripts + tools.
+          # Install Docker, the CloudFormation helper (cfn-signal), and unzip.
           dnf install -y docker aws-cfn-bootstrap unzip
+          # Start Docker now and on every reboot.
           systemctl enable --now docker
 
-          # Docker Compose + buildx plugins, pinned and checksum-verified.
+          # Folder where Docker looks for CLI plugins.
           PLUGINS=/usr/local/lib/docker/cli-plugins
+          # Create it.
           mkdir -p "$PLUGINS"
+          # Download Docker Compose (pinned version).
           curl -fsSL -o "$PLUGINS/docker-compose" \
-            https://github.com/docker/compose/releases/download/v5.6.1/docker-compose-linux-aarch64
-          echo "42cfa75f51ad0ccf290bad37899e0038a8c10a0069e85233ecc1d53e3ff1347d  $PLUGINS/docker-compose" | sha256sum -c -
+            https://github.com/docker/compose/releases/download/v5.6.1/docker-compose-linux-x86_64
+          # Refuse to continue if the file doesn't match the known checksum.
+          echo "47737f4236e6d3ccea7291995203f8f018058783b4c3a9469119811a0b5db8c0  $PLUGINS/docker-compose" | sha256sum -c -
+          # Download Docker buildx, used by "compose build" (pinned version).
           curl -fsSL -o "$PLUGINS/docker-buildx" \
-            https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.linux-arm64
-          echo "3b83b3731916ba433feccaaa689fe5bcdc81c641d92c8e6c2ea865dfa141c97a  $PLUGINS/docker-buildx" | sha256sum -c -
+            https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.linux-amd64
+          # Same checksum check.
+          echo "e25d5cd675092bb5d1d03632fdc46cdf3fede7b514dc5f023a105e00d3ce5ad4  $PLUGINS/docker-buildx" | sha256sum -c -
+          # Make both plugins executable.
           chmod +x "$PLUGINS/docker-compose" "$PLUGINS/docker-buildx"
 
-          # Code from the private artifact bucket.
+          # App folder.
           APP=/opt/rate-limiter
+          # Create it.
           mkdir -p "$APP"
+          # Download the code zip from the private artifact bucket (uses the instance role).
           aws s3 cp "s3://${ArtifactBucket}/${AppKey}" /tmp/app.zip --region ${AWS::Region}
+          # Unpack it.
           unzip -o /tmp/app.zip -d "$APP"
+          # Compose runs from the algorithm folder.
           cd "$APP/token_bucket"
 
-          # .env: random Redis password generated here, never leaves the box.
+          # New files readable by root only (protects .env).
           umask 077
+          # Write .env. The Redis password is random, made here, and never leaves the box.
           cat > .env <<EOF
           REDIS_PASSWORD=$(openssl rand -hex 32)
           RULES_BUCKET=${ArtifactBucket}
@@ -297,36 +330,46 @@ Resources:
           AWS_REGION=${AWS::Region}
           EOF
 
-          # Build and start everything (Go dependencies are resolved here).
+          # Build all images and start the stack in the background (Go deps are fetched here).
           docker compose up -d --build
 
-          # Wait until nginx and all three limiters answer.
+          # For each language...
           for path in python go node; do
+            # ...try its health check every 5 s for up to 5 min...
             for i in $(seq 1 60); do
               curl -fsS "http://127.0.0.1:8080/$path/healthz" && break
               sleep 5
             done
+            # ...and fail (-> signal 1) if it still doesn't answer.
             curl -fsS "http://127.0.0.1:8080/$path/healthz"
           done
 
+          # Everything is up: tell CloudFormation the instance is ready.
           signal 0
 
+# Values printed after deploy.
 Outputs:
+  # The instance's public address.
   PublicIp:
-    Description: Instance public IP.
-    Value: !GetAtt Instance.PublicIp
+    Description: Instance public IP. # shown in the console
+    Value: !GetAtt Instance.PublicIp # e.g. 3.120.1.2
+  # The URL to test against.
   Endpoint:
-    Description: Router base URL (reachable only after you add your IP to the security group).
-    Value: !Sub "http://${Instance.PublicIp}:8080"
+    Description: Router base URL (reachable only after you add your IP to the security group). # shown in the console
+    Value: !Sub "http://${Instance.PublicIp}:8080" # e.g. http://3.120.1.2:8080
+  # Which security group to add your IP to.
   SecurityGroupId:
-    Description: Add an inbound rule here for YOUR IP only (TCP 8080, x.x.x.x/32).
-    Value: !Ref InstanceSecurityGroup
+    Description: Add an inbound rule here for YOUR IP only (TCP 8080, x.x.x.x/32). # shown in the console
+    Value: !Ref InstanceSecurityGroup # e.g. sg-0abc...
+  # Direct link to that security group in the console.
   SecurityGroupConsole:
-    Description: Console link to edit the inbound rules.
-    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/ec2/home?region=${AWS::Region}#SecurityGroup:groupId=${InstanceSecurityGroup}"
+    Description: Console link to edit the inbound rules. # shown in the console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/ec2/home?region=${AWS::Region}#SecurityGroup:groupId=${InstanceSecurityGroup}" # click to open
+  # For opening a shell with SSM.
   InstanceId:
-    Description: For SSM Session Manager (aws ssm start-session --target <id>).
-    Value: !Ref Instance
+    Description: For SSM Session Manager (aws ssm start-session --target <id>). # shown in the console
+    Value: !Ref Instance # e.g. i-0abc...
+  # The backend Lambda's name.
   BackendFunctionName:
-    Description: Backend Lambda.
-    Value: !Ref BackendFunction
+    Description: Backend Lambda. # shown in the console
+    Value: !Ref BackendFunction # rate-limiter-dev-backend

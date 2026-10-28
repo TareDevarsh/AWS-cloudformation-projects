@@ -89,7 +89,7 @@ flowchart TB
 
 | Piece | Job | Hot path? |
 |-------|-----|-----------|
-| EC2 | One small ARM instance running Docker Compose. Deleted after each test | Yes |
+| EC2 | One small x86 instance (t3.small) running Docker Compose. Deleted after each test | Yes |
 | Router | nginx container. Single published port (8080). Routes `/python/...`, `/go/...`, `/node/...` to the matching limiter container | Yes, small fixed hop |
 | Rate limiter (per language) | Matches the request to a rule (in memory), takes a token from Redis, forwards or rejects | Yes |
 | Redis | Holds the live token count per bucket ([data model](../src/token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |

@@ -14,23 +14,28 @@
 # refill_rate tokens added per second (can be fractional)
 # cost        tokens per request (optional, default 1)
 
+# List of rules; a request is checked against every rule that matches it.
 rules:
-  - id: user
-    match: { key: user_id, path: "*" }
-    bucket_size: 10
-    refill_rate: 5
+  # Per logged-in user, on every path.
+  - id: user # Redis key: user-u<user id>
+    match: { key: user_id, path: "*" } # applies when X-User-Id is present
+    bucket_size: 10 # burst of up to 10 requests
+    refill_rate: 5 # then 5 requests per second
 
-  - id: cookie
-    match: { key: cookie, path: "*" }
-    bucket_size: 5
-    refill_rate: 2
+  # Per logged-out visitor (session cookie), on every path.
+  - id: cookie # Redis key: cookie-u<session id>
+    match: { key: cookie, path: "*" } # applies only when there's no user id
+    bucket_size: 5 # burst of up to 5
+    refill_rate: 2 # then 2 per second
 
-  - id: ip
-    match: { key: ip, path: "*" }
-    bucket_size: 20      # looser: many users can share one IP
-    refill_rate: 10
+  # Per client IP, on every path. Always checked.
+  - id: ip # Redis key: ip-u<IPv4 as a number>
+    match: { key: ip, path: "*" } # every request has an IP
+    bucket_size: 20 # looser: many users can share one IP
+    refill_rate: 10 # 10 per second
 
-  - id: login
-    match: { key: ip, path: /login }
-    bucket_size: 5
-    refill_rate: 0.1     # 1 token every 10 s
+  # Extra limit on the login page, per IP.
+  - id: login # Redis key: login-u<IPv4 as a number>
+    match: { key: ip, path: /login } # only /login
+    bucket_size: 5 # 5 attempts in a burst
+    refill_rate: 0.1 # then 1 attempt every 10 s
