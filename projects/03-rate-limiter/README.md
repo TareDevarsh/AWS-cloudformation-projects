@@ -115,6 +115,8 @@ python3 tests/integration/latency.py http://<PublicIp>:8080 100
 ./scripts/destroy.sh dev us-east-1         # deletes the stack and this stage's uploaded artifacts
 ```
 
+In org-managed accounts that deny `iam:DeleteRole`, `destroy.sh` keeps the two IAM roles (free, unused) so the stack still finishes deleting; it lists them so you can remove them later.
+
 Change only `rules.yaml` and re-run `deploy.sh`: the limiters pick it up within ~30 s without replacing the instance. Changing code replaces the instance (new public IP; your security group rule stays).
 
 ## Cost & security notes
