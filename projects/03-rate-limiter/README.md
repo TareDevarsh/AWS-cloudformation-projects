@@ -59,7 +59,19 @@ Latency is tracked at every step of the build. Each step adds a row here.
 
 | Step | What changed | Latency | Notes |
 |------|--------------|---------|-------|
-| | | | |
+| 1 | Token bucket, phase 1: t3.small, nginx → limiter → Redis (same box) → Lambda backend, us-east-1 | Limiter overhead **~0.3–0.7 ms** p50; Redis call **0.31–0.53 ms** p50 | Lambda invoke (~20 ms) is most of the server time; client round trip ~122–125 ms is mostly the laptop → us-east-1 link |
+
+<details><summary>Step 1 · full results per language (100 requests each, ~6 req/s, all allowed)</summary>
+
+| Language | client p50 | client p99 | server total p50 | redis p50 | redis p99 | backend p50 | limiter overhead p50 (total − backend) |
+|---|---|---|---|---|---|---|---|
+| Python | 125.22 | 144.55 | 22.30 | 0.53 | 1.01 | 21.63 | ~0.67 |
+| Go | 122.19 | 134.96 | 19.89 | 0.31 | 2.29 | 19.55 | ~0.34 |
+| Node | 123.18 | 134.85 | 20.57 | 0.47 | 0.79 | 19.99 | ~0.58 |
+
+All values in ms. Not yet measured: the nginx router hop (from the router's `request_time − upstream_time` log). At this light load the three languages are within ~0.3 ms of each other; Go has the fastest Redis p50 but a higher p99 outlier.
+
+</details>
 
 ## How it works
 
@@ -124,6 +136,6 @@ Done:
 
 Left to build:
 
-- [ ] Deploy, add owner IP, run tests, fill in the Latency table
+- [x] Deployed, ran live tests, recorded step 1 latency
 - [ ] Update `docs/diagram.py` + render `architecture.png`, `docs/workflow.md`
 - [ ] Phase 2: scale out (more instances, ElastiCache), more algorithms

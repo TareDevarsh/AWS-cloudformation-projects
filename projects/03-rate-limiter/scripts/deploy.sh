@@ -56,7 +56,7 @@ rm -f "${BUILD}/app.zip"
   cd "$SRC"
   # Everything under token_bucket/, minus local junk and secrets.
   find token_bucket -type f \
-    ! -path '*/node_modules/*' ! -path '*/__pycache__/*' \
+    ! -path '*/node_modules/*' ! -path '*/__pycache__/*' ! -path '*/.venv/*' \
     ! -name '.env' ! -name '.DS_Store' | LC_ALL=C sort > "${BUILD}/files.txt"
   HASH="$(xargs shasum -a 256 < "${BUILD}/files.txt" | shasum -a 256 | cut -c1-12)"
   echo "$HASH" > "${BUILD}/app.hash"

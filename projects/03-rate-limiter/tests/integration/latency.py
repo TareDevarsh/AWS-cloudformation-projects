@@ -7,8 +7,8 @@ No installs needed (standard library only). Run it from the laptop whose IP
 you allowed in the security group.
 
 What it does, for each language (python, go, node), one at a time:
-  1. Limit check: 12 quick requests as one user -> expect 10 allowed, then 429
-     (the "user" bucket holds 10).
+  1. Limit check: 12 requests as one user, sent in parallel -> expect exactly
+     10 allowed and 2 x 429 by the "user" rule (the bucket holds 10).
   2. Latency run: N requests paced under every limit (a fresh user id each
      time, slower than the shared "ip" bucket refills), so every request is
      allowed and reaches the backend.
@@ -26,6 +26,7 @@ import sys  # command-line arguments
 import time  # timing and pacing
 import urllib.parse  # split the endpoint URL
 import uuid  # unique user ids per run
+from concurrent.futures import ThreadPoolExecutor  # parallel burst for the limit check
 
 LANGS = ["python", "go", "node"]
 
@@ -77,18 +78,26 @@ def fmt(v):
     return "   -   " if v is None else f"{v:7.2f}"
 
 
-def limit_check(c, lang, run_id):
-    """12 fast requests as one user: the user bucket (size 10) should allow 10."""
-    statuses = []
-    for _ in range(12):
-        status, _, _, body = c.get(f"/{lang}/orders", {"X-User-Id": f"burst{run_id}{lang}"})
-        statuses.append(status)
+def limit_check(endpoint, lang, run_id):
+    """12 requests as one user, all sent at the same moment.
+
+    The user bucket holds 10. They must be sent in parallel: one after another,
+    each ~100+ ms round trip lets the bucket refill (5/s) and it never empties.
+    """
+    user = {"X-User-Id": f"burst{run_id}{lang}"}
+
+    def one(_):
+        # Own connection per request so they really run at the same time.
+        status, _, _, body = Client(endpoint).get(f"/{lang}/orders", user)
+        return status, body
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(one, range(12)))
+    statuses = [s for s, _ in results]
     allowed = statuses.count(200)
-    rule = ""
-    if 429 in statuses:
-        rule = json.loads(body or b"{}").get("rule", "")
-    ok = allowed == 10 and statuses[-1] == 429 and rule == "user"
-    print(f"  limit check: {allowed}/12 allowed, last={statuses[-1]} rule={rule!r} -> {'OK' if ok else 'UNEXPECTED'}")
+    rules = {json.loads(b or b"{}").get("rule", "") for s, b in results if s == 429}
+    ok = allowed == 10 and statuses.count(429) == 2 and rules == {"user"}
+    print(f"  limit check: {allowed}/12 allowed, {statuses.count(429)} x 429 by {sorted(rules)} -> {'OK' if ok else 'UNEXPECTED'}")
     return ok
 
 
@@ -131,7 +140,7 @@ def main():
     results, all_ok = [], True
     for lang in LANGS:
         print(f"\n== {lang}")
-        all_ok &= limit_check(c, lang, run_id)
+        all_ok &= limit_check(endpoint, lang, run_id)
         # Let the shared ip bucket refill (size 20 at 10/s -> 2 s) before timing.
         time.sleep(2.5)
         results.append(latency_run(c, lang, n, run_id))
