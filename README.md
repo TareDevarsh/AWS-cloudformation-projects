@@ -48,21 +48,8 @@ Every entry below is a link, so you can jump straight to the file.
 mindmap
   root((aws-projects))
     01 Key-Value Store
-      API Gateway + IAM auth
-      Lambda Python
-      DynamoDB on-demand
     02 Ad Creative Scorer
-      Step Functions pipeline
-      Rekognition features
-      SageMaker XGBoost
-      6 layered stacks
     03 Rate Limiter
-      Middleware on EC2 + Docker
-      Token bucket in Redis
-      Latency at every step
-    Shared
-      CONVENTIONS.md
-      _template
 ```
 
 ## How each project is built
