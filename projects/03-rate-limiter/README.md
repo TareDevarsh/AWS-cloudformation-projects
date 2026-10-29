@@ -169,9 +169,9 @@ Run from `projects/03-rate-limiter`.
 | ✅ Leaky bucket design | SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed ([details](src/leaky_bucket/README.md)) |
 | ✅ Leaky bucket code | `accept.lua`, `finish.lua`, limiter + worker in 3 languages, Compose, `Algorithm` parameter, queues + dead-letter queues, `deploy.sh` third argument |
 | ✅ Leaky bucket test script | `tests/integration/leaky_latency.py` (checked against a local stand-in only) |
+| ✅ Architecture image | `docs/diagram.py` → `docs/images/architecture.png`, both algorithms |
 
 | Next | |
 |------|---|
 | ⬜ Leaky bucket live run | Deploy with `leaky_bucket`, run the live test, record its latency |
-| ⬜ Diagrams | Update `docs/diagram.py` + render `architecture.png` |
 | ⬜ Phase 2 | Scale out (more instances, ElastiCache), more algorithms |
