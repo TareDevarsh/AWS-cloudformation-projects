@@ -50,6 +50,9 @@ mindmap
     01 Key-Value Store
     02 Ad Creative Scorer
     03 Rate Limiter
+      Middleware on EC2 + Redis
+      Token bucket
+      Leaky bucket · SQS
 ```
 
 ## How each project is built
