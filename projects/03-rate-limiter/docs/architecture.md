@@ -195,6 +195,7 @@ Each algorithm lives in its own folder under `src/` with its own README (how it 
 | Algorithm | In short | Details |
 |-----------|----------|---------|
 | Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. Runs as one atomic Lua script in Redis. | [src/token_bucket/README.md](../src/token_bucket/README.md) |
+| Leaky bucket (queue) · *design* | Requests wait in an SQS FIFO line per tier and a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. Client gets a job id and polls each second. Example: a chat agent. | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
 
 ## Latency measurement
 
