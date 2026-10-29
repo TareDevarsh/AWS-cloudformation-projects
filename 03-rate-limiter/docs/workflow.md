@@ -95,7 +95,7 @@ sequenceDiagram
 
 ## One request: leaky bucket
 
-Full flow with polling, tiers and retries: [leaky bucket README](../src/leaky_bucket/README.md#the-flow).
+Full flow with polling, tiers and retries: [leaky bucket README](leaky_bucket/README.md#the-flow).
 
 | Step | What happens |
 |------|--------------|

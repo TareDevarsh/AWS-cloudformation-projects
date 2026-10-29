@@ -6,7 +6,7 @@ Rules every project follows so the repo reads the same everywhere.
 
 ## Folder naming
 
-- `projects/NN-short-name/`. The two-digit number sets reading order (`01-key-value-store`, `02-ad-creative-scorer`).
+- `NN-short-name/` at the repo root (no `projects/` wrapper, so each project is one click from the top of the GitHub page). The two-digit number sets reading order (`01-key-value-store`, `02-ad-creative-scorer`).
 - Lowercase, hyphen-separated.
 
 ## Creating a project

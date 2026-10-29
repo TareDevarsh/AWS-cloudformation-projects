@@ -5,7 +5,7 @@
 ![Auth](https://img.shields.io/badge/auth-IAM%20SigV4-232F3E?logo=amazonaws&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 
-[← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/kv-store.yaml) · [Code](src/handler.py)
+[← Portfolio](../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/kv-store.yaml) · [Code](src/handler.py)
 
 ![Architecture](docs/images/architecture.png)
 
@@ -75,7 +75,7 @@ Detailed flows: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/ar
 ## Deploy / Test / Teardown
 
 ```bash
-cd projects/01-key-value-store
+cd 01-key-value-store
 
 # 1. Deploy (stage defaults to dev, region to $AWS_REGION or us-east-1).
 #    Creates a private artifact bucket cfn-artifacts-<account>-<region> on first run,

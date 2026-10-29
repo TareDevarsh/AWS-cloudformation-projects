@@ -5,7 +5,7 @@
 ![Auth](https://img.shields.io/badge/auth-IAM%20SigV4-232F3E?logo=amazonaws&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 
-[← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
+[← Portfolio](../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
 
 ![Architecture](docs/images/architecture.png)
 
@@ -66,7 +66,7 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 ## Deploy / Test / Teardown
 
 ```bash
-cd projects/{{NN}}-{{slug}}
+cd {{NN}}-{{slug}}
 ./scripts/deploy.sh dev us-east-1
 # python3 tests/integration/<test>.py dev us-east-1
 ./scripts/destroy.sh dev us-east-1

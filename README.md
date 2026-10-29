@@ -6,25 +6,25 @@
 ![Lint](https://img.shields.io/badge/cfn--lint-passing-brightgreen)
 
 Hands-on AWS prototypes, each deployed with **CloudFormation** and documented so that a reviewer can tell what it does and how it works in a couple of minutes.
-Every project lives in [`projects/`](projects/) and is self-contained: it has its own README, an architecture image, Mermaid flow diagrams, templates, code, tests, and scripts.
+Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) and is self-contained: it has its own README, an architecture image, Mermaid flow diagrams, templates, code, tests, and scripts.
 
 ## Projects
 
 | # | Project | What it shows | AWS services | Status |
 |---|---------|---------------|--------------|--------|
-| 01 | [**Key-Value Store**](projects/01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
-| 02 | [**Ad Creative Scorer**](projects/02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
-| 03 | [**Rate Limiter**](projects/03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket (Redis) and leaky bucket (SQS queue), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
+| 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
+| 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
+| 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket (Redis) and leaky bucket (SQS queue), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
 <table>
 <tr>
-<td width="50%" align="center"><a href="projects/01-key-value-store/"><img src="projects/01-key-value-store/docs/images/architecture.png" alt="01 Key-Value Store architecture"/></a><br/><b><a href="projects/01-key-value-store/">01 · Key-Value Store</a></b></td>
-<td width="50%" align="center"><a href="projects/02-ad-creative-scorer/"><img src="projects/02-ad-creative-scorer/docs/images/architecture.png" alt="02 Ad Creative Scorer architecture"/></a><br/><b><a href="projects/02-ad-creative-scorer/">02 · Ad Creative Scorer</a></b></td>
+<td width="50%" align="center"><a href="01-key-value-store/"><img src="01-key-value-store/docs/images/architecture.png" alt="01 Key-Value Store architecture"/></a><br/><b><a href="01-key-value-store/">01 · Key-Value Store</a></b></td>
+<td width="50%" align="center"><a href="02-ad-creative-scorer/"><img src="02-ad-creative-scorer/docs/images/architecture.png" alt="02 Ad Creative Scorer architecture"/></a><br/><b><a href="02-ad-creative-scorer/">02 · Ad Creative Scorer</a></b></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="projects/03-rate-limiter/"><img src="projects/03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="projects/03-rate-limiter/">03 · Rate Limiter</a></b></td>
+<td width="50%" align="center"><a href="03-rate-limiter/"><img src="03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="03-rate-limiter/">03 · Rate Limiter</a></b></td>
 <td width="50%"></td>
 </tr>
 </table>
@@ -36,19 +36,19 @@ Every entry below is a link, so you can jump straight to the file.
 - 📁 **[aws-projects](./)**
   - 📘 [docs/CONVENTIONS.md](docs/CONVENTIONS.md): layout, README order, diagram and security rules
   - 🧩 [_template/](_template/): project skeleton · [scripts/new-project.sh](scripts/new-project.sh) scaffolds from it
-  - 📦 **[01 · Key-Value Store](projects/01-key-value-store/)**
-    - [Architecture](projects/01-key-value-store/docs/architecture.md) · [Workflows](projects/01-key-value-store/docs/workflow.md)
-    - [Template: kv-store.yaml](projects/01-key-value-store/infrastructure/kv-store.yaml) · [Code: handler.py](projects/01-key-value-store/src/handler.py)
-    - [Integration test](projects/01-key-value-store/tests/integration/test_api.py) · [Scripts](projects/01-key-value-store/scripts/)
-  - 📦 **[02 · Ad Creative Scorer](projects/02-ad-creative-scorer/)**
-    - [Architecture](projects/02-ad-creative-scorer/docs/architecture.md) · [Workflows](projects/02-ad-creative-scorer/docs/workflow.md)
-    - [Templates: 01 to 06 stacks](projects/02-ad-creative-scorer/infrastructure/) · [Code: 5 Lambdas](projects/02-ad-creative-scorer/src/)
-    - [Integration test](projects/02-ad-creative-scorer/tests/integration/test_api.py) · [Scripts](projects/02-ad-creative-scorer/scripts/)
-  - 📦 **[03 · Rate Limiter](projects/03-rate-limiter/)**
-    - [Architecture](projects/03-rate-limiter/docs/architecture.md) · [Workflows](projects/03-rate-limiter/docs/workflow.md)
-    - [Template](projects/03-rate-limiter/infrastructure/template.yaml) · [Code](projects/03-rate-limiter/src/) · [Scripts](projects/03-rate-limiter/scripts/)
-    - Algorithms: [Token bucket](projects/03-rate-limiter/src/token_bucket/README.md) · [Leaky bucket](projects/03-rate-limiter/src/leaky_bucket/README.md)
-    - [Live tests](projects/03-rate-limiter/tests/integration/)
+  - 📦 **[01 · Key-Value Store](01-key-value-store/)**
+    - [Architecture](01-key-value-store/docs/architecture.md) · [Workflows](01-key-value-store/docs/workflow.md)
+    - [Template: kv-store.yaml](01-key-value-store/infrastructure/kv-store.yaml) · [Code: handler.py](01-key-value-store/src/handler.py)
+    - [Integration test](01-key-value-store/tests/integration/test_api.py) · [Scripts](01-key-value-store/scripts/)
+  - 📦 **[02 · Ad Creative Scorer](02-ad-creative-scorer/)**
+    - [Architecture](02-ad-creative-scorer/docs/architecture.md) · [Workflows](02-ad-creative-scorer/docs/workflow.md)
+    - [Templates: 01 to 06 stacks](02-ad-creative-scorer/infrastructure/) · [Code: 5 Lambdas](02-ad-creative-scorer/src/)
+    - [Integration test](02-ad-creative-scorer/tests/integration/test_api.py) · [Scripts](02-ad-creative-scorer/scripts/)
+  - 📦 **[03 · Rate Limiter](03-rate-limiter/)**
+    - [Architecture](03-rate-limiter/docs/architecture.md) · [Workflows](03-rate-limiter/docs/workflow.md)
+    - [Template](03-rate-limiter/infrastructure/template.yaml) · [Code](03-rate-limiter/src/) · [Scripts](03-rate-limiter/scripts/)
+    - Algorithms: [Token bucket](03-rate-limiter/docs/token_bucket/README.md) · [Leaky bucket](03-rate-limiter/docs/leaky_bucket/README.md)
+    - [Live tests](03-rate-limiter/tests/integration/)
 
 ```mermaid
 mindmap
@@ -80,33 +80,32 @@ flowchart LR
 ```text
 aws-projects/
 ├── README.md                    ← you are here: portfolio summary
+├── 01-key-value-store/
+│   ├── README.md                ← summary, diagrams, how to run
+│   ├── docs/                    ← architecture.md, workflow.md, diagram.py, images/
+│   ├── infrastructure/          ← kv-store.yaml
+│   ├── src/                     ← handler.py
+│   ├── tests/integration/       ← test_api.py
+│   └── scripts/                 ← deploy.sh, destroy.sh
+├── 02-ad-creative-scorer/
+│   ├── README.md
+│   ├── docs/
+│   ├── infrastructure/          ← 01-foundation … 06-monitoring (deploy in order)
+│   ├── src/                     ← one folder per Lambda
+│   ├── tests/integration/
+│   └── scripts/                 ← deploy.sh, train.sh, destroy.sh
+├── 03-rate-limiter/
+│   ├── README.md                ← summary, latency log
+│   ├── docs/                    ← architecture.md, workflow.md, token_bucket/, leaky_bucket/
+│   ├── infrastructure/          ← template.yaml (Algorithm parameter)
+│   ├── src/                     ← token_bucket/, leaky_bucket/, backend/
+│   ├── tests/integration/       ← latency.py, leaky_latency.py
+│   └── scripts/                 ← deploy.sh, destroy.sh
 ├── docs/
 │   └── CONVENTIONS.md           ← folder rules, README order, diagram + security standards
 ├── _template/                   ← project skeleton with {{NN}} {{slug}} {{Title}} placeholders
 ├── scripts/
-│   └── new-project.sh           ← scaffold: ./scripts/new-project.sh 03 slug "Title"
-├── projects/
-│   ├── 01-key-value-store/
-│   │   ├── README.md            ← summary, diagrams, how to run
-│   │   ├── docs/                ← architecture.md, workflow.md, diagram.py, images/
-│   │   ├── infrastructure/      ← kv-store.yaml
-│   │   ├── src/                 ← handler.py
-│   │   ├── tests/integration/   ← test_api.py
-│   │   └── scripts/             ← deploy.sh, destroy.sh
-│   ├── 02-ad-creative-scorer/
-│   │   ├── README.md
-│   │   ├── docs/
-│   │   ├── infrastructure/      ← 01-foundation … 06-monitoring (deploy in order)
-│   │   ├── src/                 ← one folder per Lambda
-│   │   ├── tests/integration/
-│   │   └── scripts/             ← deploy.sh, train.sh, destroy.sh
-│   └── 03-rate-limiter/
-│       ├── README.md            ← summary, latency log
-│       ├── docs/                ← architecture.md, workflow.md
-│       ├── infrastructure/      ← template.yaml (Algorithm parameter)
-│       ├── src/                 ← token_bucket/, leaky_bucket/, backend/
-│       ├── tests/integration/   ← latency.py, leaky_latency.py
-│       └── scripts/             ← deploy.sh, destroy.sh
+│   └── new-project.sh           ← scaffold: ./scripts/new-project.sh 04 slug "Title"
 └── .kiro/steering/              ← keeps Kiro/MCP following these conventions
 ```
 
@@ -153,7 +152,7 @@ graph TD
 ## Starting a new project
 
 ```bash
-./scripts/new-project.sh 03 url-shortener "URL Shortener"
+./scripts/new-project.sh 04 url-shortener "URL Shortener"
 ```
 
-This copies [`_template/`](_template/) to `projects/03-url-shortener/` and fills in the number, slug, and title everywhere. Then build the project, run `python3 docs/diagram.py`, add it to the table, gallery, map, and tree above, and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
+This copies [`_template/`](_template/) to `04-url-shortener/` and fills in the number, slug, and title everywhere. Then build the project, run `python3 docs/diagram.py`, add it to the table, gallery, map, and tree above, and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md).

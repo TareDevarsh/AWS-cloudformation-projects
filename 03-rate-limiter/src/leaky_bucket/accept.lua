@@ -2,7 +2,7 @@
 Leaky bucket (queue) "door guard", run atomically inside Redis.
 Decides whether a new chat request may join the line, and if so takes a
 ticket for it. It does NOT control the speed: the worker does (see
-README.md). Redis only counts who is waiting and keeps the bookkeeping.
+docs/leaky_bucket/README.md). Redis only counts who is waiting and keeps the bookkeeping.
 
 WHERE THIS FITS
   1. A request hits a limiter server (Python / Go / Node): POST /<lang>/chat.

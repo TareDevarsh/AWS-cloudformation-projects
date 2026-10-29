@@ -2,7 +2,7 @@
 
 [← Project README](../README.md) · [Architecture image](images/architecture.png) · [Workflows](workflow.md)
 
-This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](../src/token_bucket/README.md), [leaky bucket](../src/leaky_bucket/README.md)).
+This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](token_bucket/README.md), [leaky bucket](leaky_bucket/README.md)).
 
 ## Where the rate limiter sits
 
@@ -63,12 +63,12 @@ flowchart TB
 | EC2 | One small x86 instance (t3.small) running Docker Compose. Deleted after each test | Yes |
 | Router | nginx container. The only published port (8080). Routes `/python/...`, `/go/...`, `/node/...` to the matching limiter | Yes, small fixed hop |
 | Limiter (per language) | Finds the rule (in memory), asks Redis, forwards or rejects | Yes |
-| Redis | Holds the live counters ([token bucket data](../src/token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |
+| Redis | Holds the live counters ([token bucket data](token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |
 | S3 | The source of truth for the rules (`rules.yaml`) | No |
 | Backend | Lambda stand-in for a real server. Called with the EC2 instance role (SigV4). Only sees allowed requests | Only when allowed |
-| SQS + workers | Leaky bucket only: the queue and the fixed-rate workers ([diagram](../src/leaky_bucket/README.md#how-it-works)) | Leaky bucket only |
+| SQS + workers | Leaky bucket only: the queue and the fixed-rate workers ([diagram](leaky_bucket/README.md#how-it-works)) | Leaky bucket only |
 
-Rule format and example rules: [token bucket rules](../src/token_bucket/README.md#rules).
+Rule format and example rules: [token bucket rules](token_bucket/README.md#rules).
 
 | Why not Lambda for the limiter? | |
 |---|---|
@@ -124,7 +124,7 @@ flowchart TB
 | Question | Answer |
 |----------|--------|
 | Why separate layers, not one combined key? | A combined key changes when any part changes, so clearing a cookie or switching networks would give a fresh, full bucket. With layers, the IP bucket still holds. |
-| What if one layer says no? | All-or-nothing: no bucket loses a token. The Lua script checks every bucket in one Redis call ([details](../src/token_bucket/README.md#the-lua-script)). |
+| What if one layer says no? | All-or-nothing: no bucket loses a token. The Lua script checks every bucket in one Redis call ([details](token_bucket/README.md#the-lua-script)). |
 | Test-only shortcut 1 | The user id comes from an `X-User-Id` header, which a caller can fake. In real use it would come from a verified login token. |
 | Test-only shortcut 2 | The cookie is a random session id the client sends; we don't issue or sign it. |
 
@@ -143,8 +143,8 @@ flowchart TB
 
 | Algorithm | In short | Status | Details |
 |-----------|----------|--------|---------|
-| Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. One atomic Lua script in Redis. | Deployed, measured | [src/token_bucket/README.md](../src/token_bucket/README.md) |
-| Leaky bucket (queue) | Requests wait in an SQS FIFO line per tier; a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | Built, not deployed yet | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
+| Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. One atomic Lua script in Redis. | Deployed, measured | [docs/token_bucket/README.md](token_bucket/README.md) |
+| Leaky bucket (queue) | Requests wait in an SQS FIFO line per tier; a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | Built, not deployed yet | [docs/leaky_bucket/README.md](leaky_bucket/README.md) |
 
 ## Code and container layout
 
@@ -153,8 +153,6 @@ One folder per algorithm. Each has a Compose file that starts the router, one li
 ```text
 src/
 ├── token_bucket/
-│   ├── README.md            ← how the token bucket works, data model, memory sizing
-│   ├── CODE_STRUCTURE.md    ← Merkle-tree map of these files and what each does
 │   ├── docker-compose.yml   ← router + one limiter per language + Redis
 │   ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
 │   ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
@@ -163,8 +161,6 @@ src/
 │   ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
 │   └── node/                ← server.js, package.json, package-lock.json, Dockerfile
 └── leaky_bucket/
-    ├── README.md            ← how the leaky bucket works, API, Redis data, retries, deploy and test
-    ├── CODE_STRUCTURE.md    ← Merkle-tree map of these files and what each does
     ├── docker-compose.yml   ← router + Redis + one limiter and one worker per language
     ├── accept.lua           ← the door guard: tier, line count, ticket (runs atomically in Redis)
     ├── finish.lua           ← job bookkeeping: processing / done / failed / expired
@@ -177,7 +173,7 @@ src/
 | Good to know | |
 |---|---|
 | Shared files | The leaky bucket reuses `router/nginx.conf` (mounted by its Compose file) and `token_bucket.lua` (for the polling limit) instead of copying them. Its Docker build context is `src/` for that reason. |
-| File maps | [Token bucket](../src/token_bucket/CODE_STRUCTURE.md), [leaky bucket](../src/leaky_bucket/CODE_STRUCTURE.md): every file and what it does. |
+| File maps | [Token bucket](token_bucket/CODE_STRUCTURE.md), [leaky bucket](leaky_bucket/CODE_STRUCTURE.md): every file and what it does. |
 | What goes to GitHub | Only source files and Dockerfiles (each ~10–20 lines). Images are built on the EC2 and never committed. |
 
 ## Latency measurement

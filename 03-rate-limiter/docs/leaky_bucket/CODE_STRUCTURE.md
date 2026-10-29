@@ -1,21 +1,21 @@
 # Code structure · leaky bucket
 
-[← Leaky bucket README](README.md) · [Architecture](../../docs/architecture.md) · [Token bucket code structure](../token_bucket/CODE_STRUCTURE.md)
+[← Leaky bucket README](README.md) · [Architecture](../architecture.md) · [Token bucket code structure](../token_bucket/CODE_STRUCTURE.md)
 
-A map of every file in this folder, drawn as a Merkle tree: each file has a fingerprint (short SHA-256 hash), and each folder's fingerprint is made from its children's. Change one character anywhere and that file's hash, its folder's hash, and the root hash all change, so the tree shows exactly where code changed.
+A map of every file in `src/leaky_bucket/`, drawn as a Merkle tree: each file has a fingerprint (short SHA-256 hash), and each folder's fingerprint is made from its children's. Change one character anywhere and that file's hash, its folder's hash, and the root hash all change, so the tree shows exactly where code changed.
 
 ## The tree
 
 ```mermaid
 flowchart LR
-    ROOT["leaky_bucket/<br/>1caa7dc9"]
+    ROOT["leaky_bucket/<br/>3f171867"]
 
     ROOT --> SHARED["Shared by all languages"]
     ROOT --> PY["python/<br/>59fe6b8d"]
     ROOT --> GO["go/<br/>5915b9f3"]
     ROOT --> ND["node/<br/>146e8c41"]
 
-    SHARED --> ACC["accept.lua · 18d11269<br/>the door guard, runs in Redis"]
+    SHARED --> ACC["accept.lua · 70a383a5<br/>the door guard, runs in Redis"]
     SHARED --> FIN["finish.lua · fcc813e3<br/>job bookkeeping, runs in Redis"]
     SHARED --> RULES["rules.yaml · 086918e1<br/>tiers, queue settings, poll limits"]
     SHARED --> DC["docker-compose.yml · a7859f8d<br/>starts all 8 containers"]
@@ -40,7 +40,7 @@ flowchart LR
     ND --> NDPKG["package.json · 54220b84<br/>package-lock.json · 2d93ebc5"]
 ```
 
-"Shared by all languages" is a grouping for reading only; those files sit directly in `leaky_bucket/`. `README.md` (a7e0c6cd) is also part of the root hash. The nginx config and `token_bucket.lua` are **not** in this folder: the compose file and the Dockerfiles reuse the ones in [`../token_bucket/`](../token_bucket/CODE_STRUCTURE.md).
+"Shared by all languages" is a grouping for reading only; those files sit directly in `leaky_bucket/`. The nginx config and `token_bucket.lua` are **not** in this folder: the compose file and the Dockerfiles reuse the ones in [`src/token_bucket/`](../token_bucket/CODE_STRUCTURE.md).
 
 ## What each file does
 
@@ -56,7 +56,6 @@ flowchart LR
 | `go/main.go` | Go builds one program; this file picks `limiter` or `worker` mode | The two Go containers |
 | `*/Dockerfile` · `*/Dockerfile.worker` | How to build each limiter and worker image (no logic). Build context is `src/` so they can also copy the token bucket script | `docker compose build` |
 | `requirements.txt` · `go.mod` · `package*.json` | Pinned libraries for each language | The Docker build |
-| `README.md` | How the leaky bucket works, API, Redis data, retries, deploy and test | People |
 
 ## How the files work together on one request
 
@@ -78,7 +77,7 @@ flowchart LR
 
 - **File:** SHA-256 of the file's bytes.
 - **Folder:** SHA-256 of its children's `name:hash` lines, sorted by name.
-- **Shown:** first 8 characters. Skipped: `node_modules/`, `__pycache__/`, `.venv/`, hidden files, and this file.
+- **Shown:** first 8 characters. Skipped: `node_modules/`, `__pycache__/`, `.venv/`, and hidden files. This map and the README live in `docs/`, so they are not part of the hashes.
 
 These hashes are a snapshot of the leaky bucket code at the time it was built (not yet deployed). To recompute them after a change, from `src/`:
 
@@ -89,7 +88,7 @@ S={'node_modules','__pycache__','.venv'}
 def t(p,d=0):
     if os.path.isfile(p):
         x=hashlib.sha256(open(p,'rb').read()).hexdigest();print('  '*d+os.path.basename(p),x[:8]);return x
-    k=sorted(i for i in os.listdir(p) if i not in S and not i.startswith('.') and i!='CODE_STRUCTURE.md')
+    k=sorted(i for i in os.listdir(p) if i not in S and not i.startswith('.'))
     x=hashlib.sha256('\n'.join(f'{i}:{t(os.path.join(p,i),d+1)}' for i in k).encode()).hexdigest()
     print('  '*d+os.path.basename(p)+'/',x[:8]);return x
 t('leaky_bucket')"

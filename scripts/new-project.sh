@@ -12,9 +12,9 @@ NN="$1"; SLUG="$2"; TITLE="$3"
 [[ "$TITLE" != *"|"* ]] || { echo "Title must not contain |"; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${ROOT}/projects/${NN}-${SLUG}"
+DEST="${ROOT}/${NN}-${SLUG}"
 [[ ! -e "$DEST" ]] || { echo "Already exists: $DEST"; exit 1; }
-ls "${ROOT}/projects" | grep -q "^${NN}-" && { echo "Number ${NN} already used"; exit 1; }
+ls "${ROOT}" | grep -q "^${NN}-" && { echo "Number ${NN} already used"; exit 1; }
 
 cp -R "${ROOT}/_template" "$DEST"
 
@@ -29,8 +29,8 @@ if grep -rq '{{' "$DEST" --include='*.md' --include='*.yaml' --include='*.py' --
   echo "WARN: unreplaced placeholders remain:"; grep -rn '{{' "$DEST" | head
 fi
 
-echo "Created projects/${NN}-${SLUG}"
+echo "Created ${NN}-${SLUG}"
 echo "Next:"
 echo "  1. Edit infrastructure/template.yaml, src/, docs/diagram.py"
-echo "  2. python3 projects/${NN}-${SLUG}/docs/diagram.py   # render architecture.png"
+echo "  2. python3 ${NN}-${SLUG}/docs/diagram.py   # render architecture.png"
 echo "  3. Add the project to the root README.md (table, gallery, map, mindmap, tree)"

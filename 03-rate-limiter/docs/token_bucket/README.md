@@ -1,6 +1,6 @@
 # Token bucket
 
-[← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Lua script](token_bucket.lua) · [Rules](rules.yaml) · [Code structure](CODE_STRUCTURE.md)
+[← Architecture](../architecture.md) · [Project README](../../README.md) · [Lua script](../../src/token_bucket/token_bucket.lua) · [Rules](../../src/token_bucket/rules.yaml) · [Code structure](CODE_STRUCTURE.md)
 
 The first rate limiting algorithm. All three language servers (Python, Go, Node) run the same Lua script inside Redis, so the algorithm is identical and only the server around it differs.
 
@@ -28,7 +28,7 @@ flowchart LR
 
 ## The Lua script
 
-[`token_bucket.lua`](token_bucket.lua) runs inside Redis, so read → refill → take → save happens as one step and two requests can never take the same last token.
+[`token_bucket.lua`](../../src/token_bucket/token_bucket.lua) runs inside Redis, so read → refill → take → save happens as one step and two requests can never take the same last token.
 
 | Idea | What it means |
 |------|---------------|
@@ -84,7 +84,7 @@ rules:
 
 </details>
 
-A rule matches on both the caller (`key`) and the endpoint (`path`). How callers are identified: [Identifying the caller](../../docs/architecture.md#identifying-the-caller). The live file is [`rules.yaml`](rules.yaml).
+A rule matches on both the caller (`key`) and the endpoint (`path`). How callers are identified: [Identifying the caller](../architecture.md#identifying-the-caller). The live file is [`rules.yaml`](../../src/token_bucket/rules.yaml).
 
 ## Data model (Redis)
 
@@ -197,9 +197,7 @@ A caller uses ~2 buckets, not 4: `user` or `cookie` (never both) + `ip`, plus `l
 ## Files
 
 ```text
-token_bucket/
-├── README.md            ← this file
-├── CODE_STRUCTURE.md    ← Merkle-tree map of these files
+src/token_bucket/            (docs for this folder: docs/token_bucket/)
 ├── token_bucket.lua     ← the algorithm (runs in Redis)
 ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
 ├── docker-compose.yml   ← router + 3 limiters + Redis

@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![ML](https://img.shields.io/badge/ML-SageMaker%20XGBoost-01A88D?logo=amazonaws&logoColor=white)
 
-[← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Templates](infrastructure/) · [Code](src/)
+[← Portfolio](../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Templates](infrastructure/) · [Code](src/)
 
 ![Architecture](docs/images/architecture.png)
 
@@ -193,7 +193,7 @@ Template dependency order (each stack imports exports from earlier ones):
 | 6 | `06-monitoring.yaml` | `ad-scorer-<env>-monitoring` | Alarms, dashboard, SNS |
 
 ```bash
-cd projects/02-ad-creative-scorer
+cd 02-ad-creative-scorer
 
 # 1. First deploy: stacks 01-04 and 06. Stack 05 is skipped until a model exists.
 #    Usage: deploy.sh <env> <region> <alert-email> [model-s3-key]

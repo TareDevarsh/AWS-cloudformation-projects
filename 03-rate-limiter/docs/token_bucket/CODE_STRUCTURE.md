@@ -1,14 +1,14 @@
 # Code structure · token bucket
 
-[← Token bucket README](README.md) · [Architecture](../../docs/architecture.md)
+[← Token bucket README](README.md) · [Architecture](../architecture.md)
 
-A map of every file in this folder, drawn as a Merkle tree: each file has a fingerprint (short SHA-256 hash), and each folder's fingerprint is made from its children's. Change one character anywhere and that file's hash, its folder's hash, and the root hash all change, so the tree shows exactly where code changed.
+A map of every file in `src/token_bucket/`, drawn as a Merkle tree: each file has a fingerprint (short SHA-256 hash), and each folder's fingerprint is made from its children's. Change one character anywhere and that file's hash, its folder's hash, and the root hash all change, so the tree shows exactly where code changed.
 
 ## The tree
 
 ```mermaid
 flowchart LR
-    ROOT["token_bucket/<br/>15aa66c0"]
+    ROOT["token_bucket/<br/>adfbc56d"]
 
     ROOT --> SHARED["Shared by all languages"]
     ROOT --> PY["python/<br/>b2bc9186"]
@@ -35,7 +35,7 @@ flowchart LR
     RT --> NGX["nginx.conf · efdb8e99<br/>routes /python /go /node"]
 ```
 
-"Shared by all languages" is a grouping for reading only; those files sit directly in `token_bucket/`. `README.md` (542ab97f) is also part of the root hash.
+"Shared by all languages" is a grouping for reading only; those files sit directly in `token_bucket/`.
 
 ## What each file does
 
@@ -48,7 +48,6 @@ flowchart LR
 | `python/app.py` · `go/main.go` · `node/server.js` | Same job in 3 languages: read caller ids, pick matching rules, one Redis call, then call the backend or return 429 | Their own container |
 | `*/Dockerfile` | How to build each container image (no logic) | `docker compose build` |
 | `requirements.txt` · `go.mod` · `package*.json` | Pinned libraries for each language | The Docker build |
-| `README.md` | How the token bucket works, Redis data model, memory sizing | People |
 
 ## How the files work together on one request
 
@@ -65,7 +64,7 @@ flowchart LR
 
 - **File:** SHA-256 of the file's bytes.
 - **Folder:** SHA-256 of its children's `name:hash` lines, sorted by name.
-- **Shown:** first 8 characters. Skipped: `node_modules/`, `__pycache__/`, `.venv/`, hidden files, and this file.
+- **Shown:** first 8 characters. Skipped: `node_modules/`, `__pycache__/`, `.venv/`, and hidden files. This map and the README live in `docs/`, so they are not part of the hashes.
 
 These hashes are a snapshot of the phase 1 code. To recompute them after a change, from `src/`:
 
@@ -76,7 +75,7 @@ S={'node_modules','__pycache__','.venv'}
 def t(p,d=0):
     if os.path.isfile(p):
         x=hashlib.sha256(open(p,'rb').read()).hexdigest();print('  '*d+os.path.basename(p),x[:8]);return x
-    k=sorted(i for i in os.listdir(p) if i not in S and not i.startswith('.') and i!='CODE_STRUCTURE.md')
+    k=sorted(i for i in os.listdir(p) if i not in S and not i.startswith('.'))
     x=hashlib.sha256('\n'.join(f'{i}:{t(os.path.join(p,i),d+1)}' for i in k).encode()).hexdigest()
     print('  '*d+os.path.basename(p)+'/',x[:8]);return x
 t('token_bucket')"

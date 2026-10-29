@@ -1,6 +1,6 @@
 # Leaky bucket (queue)
 
-[← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Token bucket](../token_bucket/README.md) · [Code structure](CODE_STRUCTURE.md)
+[← Architecture](../architecture.md) · [Project README](../../README.md) · [Token bucket](../token_bucket/README.md) · [Code structure](CODE_STRUCTURE.md)
 
 The second rate limiting algorithm. Requests wait in a line and are processed at a **fixed speed**. Example used throughout: a **chat agent**, where every message waits its turn for the busy model, and business users get a faster lane.
 
@@ -54,7 +54,7 @@ Like a coffee shop:
 
 | Step | Do | Where |
 |------|----|-------|
-| 1 | Add an entry under `tiers`: `id`, `name`, `leak_rate`, `max_waiting` | [`rules.yaml`](rules.yaml) |
+| 1 | Add an entry under `tiers`: `id`, `name`, `leak_rate`, `max_waiting` | [`rules.yaml`](../../src/leaky_bucket/rules.yaml) |
 | 2 | Add the tier number to the tier list of the queue loop (and the matching list in `Outputs`). This creates one queue + one dead-letter queue per language | [`infrastructure/template.yaml`](../../infrastructure/template.yaml) |
 | 3 | Deploy. Limiters pick up `rules.yaml` within ~30 s. **Workers read the rules once at start**, so restart them (a code change replaces the instance, which does the same) | `deploy.sh` |
 | 4 | Put users in the new tier: `HSET tiers <user> <tier>` (or add test users to `seed_tiers`) | Redis |
@@ -149,7 +149,7 @@ sequenceDiagram
 | Receive batch | at most `max(1, 2 × leak_rate)` and 10 | Small batches keep buffered jobs from sitting hidden for long. |
 | Dead-letter queues | kept 1 day | Moved messages keep their original age, so a 120 s retention there would purge them at once. |
 
-All of these (except the queue properties in CloudFormation) are in [`rules.yaml`](rules.yaml) under `queue:`.
+All of these (except the queue properties in CloudFormation) are in [`rules.yaml`](../../src/leaky_bucket/rules.yaml) under `queue:`.
 
 ## Redis data
 
@@ -168,14 +168,14 @@ Two atomic Lua scripts do all the bookkeeping:
 
 | Script | Does | Returns |
 |--------|------|---------|
-| [`accept.lua`](accept.lua) | Reads the tier, compares the user's line count with the tier's `max_waiting`. Full → refuses, writes nothing. Room → line count +1, takes a ticket, creates the job | accepted, tier, ticket, position, `retry_after_ms` |
-| [`finish.lua`](finish.lua) | Moves a job to `processing`, `done`, `failed` or `expired`. Ending a job saves the answer or error, line count −1 (never below 0), "now serving" +1. Safe to call twice (SQS can deliver a message again) | changed or not |
+| [`accept.lua`](../../src/leaky_bucket/accept.lua) | Reads the tier, compares the user's line count with the tier's `max_waiting`. Full → refuses, writes nothing. Room → line count +1, takes a ticket, creates the job | accepted, tier, ticket, position, `retry_after_ms` |
+| [`finish.lua`](../../src/leaky_bucket/finish.lua) | Moves a job to `processing`, `done`, `failed` or `expired`. Ending a job saves the answer or error, line count −1 (never below 0), "now serving" +1. Safe to call twice (SQS can deliver a message again) | changed or not |
 
 Both build some key names from their arguments. Fine on the single Redis node used here; Redis Cluster would need hash tags (phase 2).
 
 ## Polling limit
 
-The client polls `GET /result/<job_id>` once per second. The limit reuses `../token_bucket/token_bucket.lua` (not copied; the Docker build context is `src/`).
+The client polls `GET /result/<job_id>` once per second. The limit reuses `src/token_bucket/token_bucket.lua` (not copied; the Docker build context is `src/`).
 
 | Limit | Allowance | Over it |
 |-------|-----------|---------|
@@ -199,7 +199,7 @@ Job ids are random UUIDs, and a poll must come from the user who sent the job, s
 
 ## Deploy, test, teardown
 
-Run from `projects/03-rate-limiter`:
+Run from `03-rate-limiter`:
 
 | Step | Command |
 |------|---------|

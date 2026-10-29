@@ -5,7 +5,7 @@
 ![Access](https://img.shields.io/badge/access-owner%20IP%20only-orange)
 ![Languages](https://img.shields.io/badge/limiters-Python%20%C2%B7%20Go%20%C2%B7%20Node-3776AB)
 
-[← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
+[← Portfolio](../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
 
 ![Architecture](docs/images/architecture.png)
 
@@ -20,7 +20,7 @@ The project is built in small steps. Each step is designed and agreed before it'
 | Status | 🟡 Prototype: token bucket deployed and measured; leaky bucket built, not deployed yet |
 | Where it runs | One EC2 (t3.small) + Docker Compose: nginx router, one limiter per language, Redis |
 | Languages | Python, Go, Node (same algorithm, compared side by side) |
-| Algorithms | [Token bucket](src/token_bucket/README.md) · [Leaky bucket (SQS queue)](src/leaky_bucket/README.md) |
+| Algorithms | [Token bucket](docs/token_bucket/README.md) · [Leaky bucket (SQS queue)](docs/leaky_bucket/README.md) |
 | Who is limited | User id + cookie + IP, checked together ([details](docs/architecture.md#identifying-the-caller)) |
 | Rules | `rules.yaml` in S3, kept in limiter memory, re-read when it changes |
 | Backend | AWS Lambda (stand-in for a real server) |
@@ -50,7 +50,7 @@ flowchart TB
     S3[(S3 · rules.yaml)] -. "re-read when changed" .-> LIM
 ```
 
-The leaky bucket adds SQS queues and one worker per language to this picture: see [its diagram](src/leaky_bucket/README.md#how-it-works).
+The leaky bucket adds SQS queues and one worker per language to this picture: see [its diagram](docs/leaky_bucket/README.md#how-it-works).
 
 ## Latency
 
@@ -86,8 +86,8 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 |-----------|-----|
 | [docs/architecture.md](docs/architecture.md) | Placement, identity, rules, security, all decisions |
 | [docs/workflow.md](docs/workflow.md) | Deploy → boot → test → destroy, step by step |
-| [Token bucket README](src/token_bucket/README.md) | Algorithm 1, its Redis data and memory sizing |
-| [Leaky bucket README](src/leaky_bucket/README.md) | Algorithm 2, the queue, API and retries |
+| [Token bucket README](docs/token_bucket/README.md) | Algorithm 1, its Redis data and memory sizing |
+| [Leaky bucket README](docs/leaky_bucket/README.md) | Algorithm 2, the queue, API and retries |
 
 ## Repo layout
 
@@ -97,21 +97,19 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 ├── docs/
 │   ├── architecture.md       ← placement, routing, identity, security, decisions
 │   ├── workflow.md           ← deploy lifecycle and request flow
+│   ├── token_bucket/         ← README.md (how it works, Redis data) + CODE_STRUCTURE.md (Merkle-tree file map)
+│   ├── leaky_bucket/         ← README.md (queue, API, retries) + CODE_STRUCTURE.md (Merkle-tree file map)
 │   ├── diagram.py            ← diagram-as-code (AWS icons)
 │   └── images/architecture.png
 ├── infrastructure/
 │   └── template.yaml         ← CloudFormation stack
 ├── src/
 │   ├── token_bucket/
-│   │   ├── README.md         ← how the token bucket works, Redis data model, memory sizing
-│   │   ├── CODE_STRUCTURE.md ← Merkle-tree map of the files
 │   │   ├── token_bucket.lua  ← the algorithm (runs in Redis)
 │   │   ├── rules.yaml        ← rate limit rules
 │   │   ├── docker-compose.yml, router/nginx.conf
 │   │   └── python/ go/ node/ ← one limiter server per language
 │   ├── leaky_bucket/
-│   │   ├── README.md         ← how the leaky bucket works, API, Redis data, retries, deploy and test
-│   │   ├── CODE_STRUCTURE.md ← Merkle-tree map of the files
 │   │   ├── accept.lua, finish.lua ← door guard and job bookkeeping (run in Redis)
 │   │   ├── rules.yaml        ← tiers, queue settings, poll limits
 │   │   ├── docker-compose.yml
@@ -138,7 +136,7 @@ The third `deploy.sh` argument picks the algorithm (default `token_bucket`). Ste
 | 3. Test | `python3 tests/integration/latency.py http://<PublicIp>:8080 100` | `python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3` (3 rounds per language) |
 | 4. Tear down | `./scripts/destroy.sh dev us-east-1` | same |
 
-Run from `projects/03-rate-limiter`.
+Run from `03-rate-limiter`.
 
 | Good to know | |
 |--------------|---|
@@ -160,13 +158,13 @@ Run from `projects/03-rate-limiter`.
 
 | Done | |
 |------|---|
-| ✅ Token bucket | Lua, multi-bucket, all-or-nothing ([details](src/token_bucket/README.md)) |
+| ✅ Token bucket | Lua, multi-bucket, all-or-nothing ([details](docs/token_bucket/README.md)) |
 | ✅ Limiter servers | Python, Go, Node |
 | ✅ Router + Compose | nginx, Redis with a password, one published port |
 | ✅ CloudFormation | VPC, EC2 t3.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean) |
 | ✅ Scripts + live test | `deploy.sh`, `destroy.sh`, `tests/integration/latency.py` |
 | ✅ Token bucket live run | Deployed, tested, step 1 latency recorded |
-| ✅ Leaky bucket design | SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed ([details](src/leaky_bucket/README.md)) |
+| ✅ Leaky bucket design | SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed ([details](docs/leaky_bucket/README.md)) |
 | ✅ Leaky bucket code | `accept.lua`, `finish.lua`, limiter + worker in 3 languages, Compose, `Algorithm` parameter, queues + dead-letter queues, `deploy.sh` third argument |
 | ✅ Leaky bucket test script | `tests/integration/leaky_latency.py` (checked against a local stand-in only) |
 | ✅ Architecture image | `docs/diagram.py` → `docs/images/architecture.png`, both algorithms |
