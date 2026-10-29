@@ -168,23 +168,35 @@ Options considered:
 
 ## Code and container layout
 
-One folder per algorithm. Each has a Compose file that starts the router, one limiter per language, and Redis. The algorithm itself is a Lua script that runs inside Redis, shared by every language.
+One folder per algorithm. Each has a Compose file that starts the router, one limiter per language, and Redis (the leaky bucket also starts one worker per language). The algorithm's Redis part is a Lua script that runs inside Redis, shared by every language.
 
 ```text
 src/
-└── token_bucket/
-    ├── README.md            ← how the token bucket works, data model, memory sizing
+├── token_bucket/
+│   ├── README.md            ← how the token bucket works, data model, memory sizing
+│   ├── CODE_STRUCTURE.md    ← Merkle-tree map of these files and what each does
+│   ├── docker-compose.yml   ← router + one limiter per language + Redis
+│   ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
+│   ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
+│   ├── router/nginx.conf    ← nginx: routes /python, /go, /node (also used by leaky_bucket)
+│   ├── python/              ← app.py, requirements.txt, Dockerfile
+│   ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
+│   └── node/                ← server.js, package.json, package-lock.json, Dockerfile
+└── leaky_bucket/
+    ├── README.md            ← how the leaky bucket works, API, Redis data, retries, deploy and test
     ├── CODE_STRUCTURE.md    ← Merkle-tree map of these files and what each does
-    ├── docker-compose.yml   ← router + one limiter per language + Redis
-    ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
-    ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
-    ├── router/nginx.conf    ← nginx: routes /python, /go, /node
-    ├── python/              ← app.py, requirements.txt, Dockerfile
-    ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
-    └── node/                ← server.js, package.json, package-lock.json, Dockerfile
+    ├── docker-compose.yml   ← router + Redis + one limiter and one worker per language
+    ├── accept.lua           ← the door guard: tier, line count, ticket (runs atomically in Redis)
+    ├── finish.lua           ← job bookkeeping: processing / done / failed / expired
+    ├── rules.yaml           ← tiers, queue settings, poll limits (uploaded to S3 on deploy)
+    ├── python/              ← app.py (limiter), worker.py, common.py, requirements.txt, 2 Dockerfiles
+    ├── go/                  ← main.go, limiter.go, worker.go, common.go, go.mod, 2 Dockerfiles (one binary, two modes)
+    └── node/                ← server.js (limiter), worker.js, common.js, package files, 2 Dockerfiles
 ```
 
-Diagram of every file and what it does: [src/token_bucket/CODE_STRUCTURE.md](../src/token_bucket/CODE_STRUCTURE.md).
+The leaky bucket reuses two token bucket files instead of copying them: `router/nginx.conf` (mounted by its Compose file) and `token_bucket.lua` (copied into its limiter images, for the polling limit). Its Docker build context is `src/` for that reason.
+
+Diagram of every file and what it does: [token bucket](../src/token_bucket/CODE_STRUCTURE.md), [leaky bucket](../src/leaky_bucket/CODE_STRUCTURE.md).
 
 Only source files and Dockerfiles go to GitHub (each Dockerfile is ~10-20 lines). Images are built on the EC2 instance and never committed.
 
@@ -195,7 +207,7 @@ Each algorithm lives in its own folder under `src/` with its own README (how it 
 | Algorithm | In short | Details |
 |-----------|----------|---------|
 | Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. Runs as one atomic Lua script in Redis. | [src/token_bucket/README.md](../src/token_bucket/README.md) |
-| Leaky bucket (queue) · *design* | Requests wait in an SQS FIFO line per tier and a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. Client gets a job id and polls each second. Example: a chat agent. | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
+| Leaky bucket (queue) · *built, not deployed yet* | Requests wait in an SQS FIFO line per tier and a worker processes them at a fixed rate (regular 1/s, business 5/s). A user with a full line gets 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
 
 ## Latency measurement
 
@@ -216,6 +228,7 @@ This project deliberately deviates from the repo default of IAM (SigV4) auth on 
 - Plain HTTP over the internet. Test data only.
 - Redis is never published; it is reachable only on the Docker network.
 - The backend Lambda is invoked with the instance role (least privilege: `lambda:InvokeFunction` on that one function).
+- With the leaky bucket, the role may also use the SQS queues of this stage only (send, receive, delete, change visibility, read attributes on `rate-limiter-<stage>-*`).
 - The stack is deleted after each test session.
 
 Do not copy this pattern for anything long-lived.
@@ -233,7 +246,9 @@ Parked: fail open vs fail closed.
 |----------|--------|--------------|-----|
 | Rate limiter placement | Middleware between client and servers | Client side, server side | Can't be bypassed, keeps rejected traffic off the backend, separates limits from business logic |
 | Backend | AWS Lambda (test stand-in for a real server) | | Cheap for testing |
-| Algorithm | Token bucket (bucket size, refill rate) | | First algorithm to build |
+| Algorithm | Token bucket (bucket size, refill rate), then leaky bucket as a queue | | Token bucket first; leaky bucket second, same router, Redis and EC2, selected by the `Algorithm` stack parameter |
+| Leaky bucket queue | SQS FIFO, one queue per language and tier | Redis list on the EC2 | Queue lives outside the instance, strict order, built-in retries and dead-letter queue |
+| Who sets the leak rate | The worker (one pacing loop per tier) | Redis delaying the reply | The worker starts one job every `1 / leak_rate` s; Redis only does bookkeeping |
 | Middleware compute (phase 1) | One EC2 + Docker Compose | Lambda | Behaves like the real long-running server; no cold starts or VPC complexity |
 | Lambda middleware | Rejected | Concurrency 1, normal concurrency | Cold starts, no shared memory, throttling at concurrency 1; measures Lambda, not the limiter |
 | Counter store | Redis container on the same EC2 | ElastiCache | Cheapest for phase 1; ElastiCache in phase 2 |

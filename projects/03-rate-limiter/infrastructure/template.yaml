@@ -1,14 +1,18 @@
 # CloudFormation template format version (the only valid value).
 AWSTemplateFormatVersion: "2010-09-09"
+# Adds Fn::ForEach (used below: one queue per language x tier). Deploying needs CAPABILITY_AUTO_EXPAND (deploy.sh passes it).
+Transform: AWS::LanguageExtensions
 # Shown in the CloudFormation console for this stack.
 Description: >-
-  03-rate-limiter: one EC2 running nginx + token bucket limiters (Python, Go,
-  Node) + Redis in Docker Compose, in front of a Lambda backend. Short-lived
-  test stack: delete after each session.
+  03-rate-limiter: one EC2 running nginx + rate limiters (Python, Go, Node;
+  token bucket or leaky bucket) + Redis in Docker Compose, in front of a Lambda
+  backend. The leaky bucket also gets SQS FIFO queues. Short-lived test stack:
+  delete after each session.
 
 # How this stack is used:
-#   1. scripts/deploy.sh uploads the code zip and rules.yaml to the private
-#      artifact bucket, then deploys this template with their S3 keys.
+#   1. scripts/deploy.sh uploads the code zip and the chosen algorithm's
+#      rules.yaml to the private artifact bucket, then deploys this template
+#      with their S3 keys and the Algorithm (token_bucket or leaky_bucket).
 #   2. The EC2 boots, installs Docker, downloads the code, starts Compose, and
 #      signals CloudFormation once all three limiters answer /healthz.
 #   3. The security group starts with NO inbound rules. The owner adds their
@@ -16,6 +20,13 @@ Description: >-
 
 # Inputs chosen at deploy time.
 Parameters:
+  # Which rate limiting algorithm the instance runs.
+  Algorithm:
+    Type: String # folder name under src/ in the code zip
+    Default: token_bucket # the original stack, no queues...
+    AllowedValues: [token_bucket, leaky_bucket] # ...or the queue-based one (also creates the SQS queues below)
+    Description: Algorithm to run. leaky_bucket also creates the SQS FIFO queues (one per language and tier).
+
   # Environment name, used in resource names and tags.
   Stage:
     Type: String # free text...
@@ -50,6 +61,11 @@ Parameters:
   RulesKey:
     Type: String # e.g. 03-rate-limiter/dev/rules.yaml
     Description: S3 key of rules.yaml. Limiters re-read it when its ETag changes.
+
+# Switches that turn parts of the stack on or off.
+Conditions:
+  # True only for the leaky bucket: the SQS queues and their permissions exist only then.
+  IsLeaky: !Equals [!Ref Algorithm, leaky_bucket]
 
 # Everything this stack creates.
 Resources:
@@ -191,6 +207,52 @@ Resources:
         - { Key: Stage, Value: !Ref Stage } # repo tag convention
 
   # ---------------------------------------------------------------------------
+  # Queues (leaky bucket only): one SQS FIFO queue per language x tier, each
+  # with its own dead-letter queue (DLQ). 3 languages x 2 tiers = 6 + 6.
+  # To add a tier: add its number to the tier list below (and in Outputs) and
+  # add it to rules.yaml.
+  # ---------------------------------------------------------------------------
+
+  # Loop 1: once per language (Lang = python, go, node).
+  Fn::ForEach::Languages:
+    - Lang # placeholder replaced by each language below
+    - [python, go, node] # languages (must match the LANGUAGE value of the limiters and workers)
+    # Loop 2 (inside loop 1): once per tier (Tier = 0, 1).
+    - Fn::ForEach::Tiers:
+        - Tier # placeholder replaced by each tier number below
+        - ["0", "1"] # tier numbers: 0 regular, 1 business (same ids as rules.yaml)
+        # Created for every language x tier pair (logical ids like DlqpythonT0, QueuepythonT0).
+        - Dlq${Lang}T${Tier}:
+            Type: AWS::SQS::Queue # a queue; this one holds jobs that failed 5 times
+            Condition: IsLeaky # only created for the leaky bucket
+            Properties:
+              QueueName: !Sub "rate-limiter-${Stage}-${Lang}-t${Tier}-dlq.fifo" # name must end in .fifo
+              FifoQueue: true # the dead-letter queue of a FIFO queue must be FIFO too
+              MessageRetentionPeriod: 86400 # 1 day to inspect failures (moved messages keep their age, so 120 s would purge them at once)
+              SqsManagedSseEnabled: true # encryption at rest with SQS-managed keys
+              Tags:
+                - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+                - { Key: Stage, Value: !Ref Stage } # repo tag convention
+          Queue${Lang}T${Tier}:
+            Type: AWS::SQS::Queue # the line users wait in
+            Condition: IsLeaky # only created for the leaky bucket
+            Properties:
+              QueueName: !Sub "rate-limiter-${Stage}-${Lang}-t${Tier}.fifo" # the name limiters and workers build from SQS_PREFIX
+              FifoQueue: true # strict first-in, first-out order
+              ContentBasedDeduplication: false # off: the limiter sets the deduplication id (the job id)
+              MessageRetentionPeriod: 120 # a job waiting more than 2 minutes is dropped (the poll then says "expired")
+              VisibilityTimeout: 10 # a received job stays hidden 10 s; short, so a stuck head of the line comes back soon
+              SqsManagedSseEnabled: true # encryption at rest with SQS-managed keys
+              RedrivePolicy:
+                deadLetterTargetArn: !GetAtt # where a job goes after too many tries
+                  - !Sub "Dlq${Lang}T${Tier}" # the DLQ made just above, same language and tier
+                  - Arn # its ARN
+                maxReceiveCount: 5 # after 5 receives the job moves to the DLQ (the worker marks it "failed" on the 5th)
+              Tags:
+                - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
+                - { Key: Stage, Value: !Ref Stage } # repo tag convention
+
+  # ---------------------------------------------------------------------------
   # EC2: role, launch template, instance.
   # ---------------------------------------------------------------------------
 
@@ -219,6 +281,17 @@ Resources:
               - Effect: Allow # allow...
                 Action: lambda:InvokeFunction # ...calling a Lambda...
                 Resource: !GetAtt BackendFunction.Arn # ...only the backend
+              - !If # SQS access exists only for the leaky bucket
+                - IsLeaky # condition
+                - Effect: Allow # allow...
+                  Action: # ...the queue calls the limiters and workers make...
+                    - sqs:SendMessage # limiter: put a job in the line
+                    - sqs:ReceiveMessage # worker: take the next job
+                    - sqs:DeleteMessage # worker: remove a finished job
+                    - sqs:ChangeMessageVisibility # worker: bring a failed job back sooner
+                    - sqs:GetQueueAttributes # SDKs read queue attributes
+                  Resource: !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:rate-limiter-${Stage}-*" # ...only on this stage's queues, nothing else
+                - !Ref AWS::NoValue # token bucket: no statement at all
       Tags:
         - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
         - { Key: Stage, Value: !Ref Stage } # repo tag convention
@@ -316,8 +389,8 @@ Resources:
           aws s3 cp "s3://${ArtifactBucket}/${AppKey}" /tmp/app.zip --region ${AWS::Region}
           # Unpack it.
           unzip -o /tmp/app.zip -d "$APP"
-          # Compose runs from the algorithm folder.
-          cd "$APP/token_bucket"
+          # Compose runs from the algorithm folder (token_bucket or leaky_bucket).
+          cd "$APP/${Algorithm}"
 
           # New files readable by root only (protects .env).
           umask 077
@@ -328,9 +401,11 @@ Resources:
           RULES_KEY=${RulesKey}
           BACKEND_FUNCTION=${BackendFunction}
           AWS_REGION=${AWS::Region}
+          SQS_PREFIX=https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/rate-limiter-${Stage}-
           EOF
 
           # Build all images and start the stack in the background (Go deps are fetched here).
+          # SQS_PREFIX in .env is used only by the leaky bucket; the token bucket ignores it.
           docker compose up -d --build
 
           # For each language...
@@ -349,6 +424,18 @@ Resources:
 
 # Values printed after deploy.
 Outputs:
+  # One queue URL per language x tier (leaky bucket only).
+  Fn::ForEach::QueueUrlLanguages:
+    - Lang # placeholder replaced by each language
+    - [python, go, node] # same languages as the queues
+    - Fn::ForEach::QueueUrlTiers:
+        - Tier # placeholder replaced by each tier number
+        - ["0", "1"] # same tiers as the queues
+        - QueueUrl${Lang}T${Tier}:
+            Condition: IsLeaky # only printed for the leaky bucket
+            Description: SQS FIFO queue URL (language and tier are in the output name). # shown in the console; plain text, no loop placeholder
+            Value: !Ref # a queue's Ref is its URL
+              Fn::Sub: Queue${Lang}T${Tier} # the queue made by the loops above
   # The instance's public address.
   PublicIp:
     Description: Instance public IP. # shown in the console

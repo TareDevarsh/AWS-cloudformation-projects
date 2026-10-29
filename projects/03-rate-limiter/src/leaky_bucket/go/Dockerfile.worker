@@ -1,0 +1,30 @@
+# Go leaky bucket WORKER (the leak: starts jobs at a fixed rate).
+# Same Go program as the limiter image, started in worker mode.
+# Build context is src/ (one level above leaky_bucket/), same as the limiter image:
+#   docker build -f leaky_bucket/go/Dockerfile.worker -t worker-go .
+# --- Stage 1: build ---------------------------------------------------------
+# Official Go image with the compiler.
+FROM golang:1.27 AS build
+# Work in /src.
+WORKDIR /src
+# Copy the module file first, so the dependency step is cached.
+COPY leaky_bucket/go/go.mod ./
+# Copy the code (tidy needs it to see which packages are imported).
+COPY leaky_bucket/go/*.go ./
+# Download pinned deps and write go.sum; each download is checked against
+# Go's checksum database (sum.golang.org).
+RUN go mod tidy
+# Build one static binary (no C libraries), stripped of debug info (-s -w).
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /leaky .
+# --- Stage 2: run -----------------------------------------------------------
+# Minimal image: just the binary, CA certificates for AWS HTTPS, and a non-root user.
+FROM gcr.io/distroless/static-debian12:nonroot
+# The compiled program from stage 1.
+COPY --from=build /leaky /leaky
+# The finish script and the default rules (the worker never uses the other scripts).
+COPY leaky_bucket/finish.lua leaky_bucket/rules.yaml /app/
+# No port at all: the worker only makes outgoing calls (Redis, SQS, Lambda).
+# The FINISH_LUA / RULES_FILE variables point at the files copied above.
+ENV LANGUAGE=go FINISH_LUA=/app/finish.lua RULES_FILE=/app/rules.yaml
+# Start the worker mode (image already runs as the "nonroot" user).
+ENTRYPOINT ["/leaky", "worker"]

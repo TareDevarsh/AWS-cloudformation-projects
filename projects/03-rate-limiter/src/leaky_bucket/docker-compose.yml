@@ -1,0 +1,140 @@
+# Leaky bucket (queue) stack: nginx router + one limiter and one worker per language + Redis.
+# The queues themselves are SQS FIFO queues (created by the CloudFormation template).
+#
+# Run from src/leaky_bucket/ (the folder next to ../token_bucket/ must exist, see below):
+#   docker compose up -d --build
+#
+# Needs a .env file next to this one (never committed; the EC2 boot script creates it):
+#   REDIS_PASSWORD=<random hex>         required
+#   SQS_PREFIX=<queue url prefix>       required; https://sqs.<region>.amazonaws.com/<account>/rate-limiter-<stage>-
+#   RULES_BUCKET=<s3 bucket>            optional; empty = use baked-in rules.yaml
+#   RULES_KEY=<s3 key>                  key of rules.yaml in that bucket
+#   BACKEND_FUNCTION=<lambda name>      optional; empty = local echo agent
+#   AWS_REGION=<region>                 needed for S3, SQS and Lambda calls
+#
+# Build context is ".." (the src/ folder), so the Dockerfiles can copy both
+# leaky_bucket/* and the existing token_bucket/token_bucket.lua (reused for the
+# polling limit). The router reuses token_bucket/router/nginx.conf as it is.
+#
+# Only the router publishes a port. Everything else talks over the private
+# "internal" Docker network and is unreachable from outside the EC2.
+# The containers to run.
+services:
+  # --- Router: the only public entry point ----------------------------------
+  router:
+    image: nginx:1.30.6-alpine # official nginx, stable branch, small Alpine base
+    volumes:
+      - ../token_bucket/router/nginx.conf:/etc/nginx/nginx.conf:ro # the same routing config as the token bucket (same upstream names), read-only
+    # Port 8080 on the EC2 -> 8080 in the container. This is the ONE published
+    # port. It binds all interfaces on purpose: the EC2 security group is the
+    # gate and allows only the owner's IP (added by hand after deploy).
+    ports:
+      - "8080:8080" # host:container
+    depends_on: [limiter-python, limiter-go, limiter-node] # start after the limiters exist
+    networks: [internal] # join the private network
+    restart: unless-stopped # restart on crash or reboot
+  # --- Limiters: the door (POST /chat, GET /result), three languages --------
+  limiter-python:
+    build: { context: .., dockerfile: leaky_bucket/python/Dockerfile } # context src/ (so it can copy token_bucket.lua)
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env; refuses to start if missing
+      PATH_PREFIX: /python # prefix nginx routes on; stripped before routing
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language; the limiter adds python-t<tier>.fifo
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules (empty = local file)
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      AWS_REGION: ${AWS_REGION:-} # region for S3 and SQS calls
+      AWS_DEFAULT_REGION: ${AWS_REGION:-} # boto3 also reads this name
+    depends_on: { redis: { condition: service_healthy } } # wait until Redis answers PING
+    networks: [internal] # private network only; no "ports:" = unreachable from outside
+    restart: unless-stopped # restart on crash or reboot
+  limiter-go:
+    build: { context: .., dockerfile: leaky_bucket/go/Dockerfile } # context src/
+    environment:
+      REDIS_ADDR: redis:6379 # Redis service name + port on the private network
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} # password from .env
+      PATH_PREFIX: /go # prefix nginx routes on
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      AWS_REGION: ${AWS_REGION:-} # region for S3 and SQS calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
+  limiter-node:
+    build: { context: .., dockerfile: leaky_bucket/node/Dockerfile } # context src/
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env
+      PATH_PREFIX: /node # prefix nginx routes on
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      AWS_REGION: ${AWS_REGION:-} # region for S3 and SQS calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
+  # --- Workers: the leak (start queued jobs at a fixed rate), three languages -
+  worker-python:
+    build: { context: .., dockerfile: leaky_bucket/python/Dockerfile.worker } # context src/
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules (read once at start)
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda (empty = local echo agent)
+      AWS_REGION: ${AWS_REGION:-} # region for S3, SQS and Lambda calls
+      AWS_DEFAULT_REGION: ${AWS_REGION:-} # boto3 also reads this name
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only; the worker has no port at all
+    restart: unless-stopped # restart on crash or reboot
+  worker-go:
+    build: { context: .., dockerfile: leaky_bucket/go/Dockerfile.worker } # context src/
+    environment:
+      REDIS_ADDR: redis:6379 # Redis service name + port on the private network
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} # password from .env
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules (read once at start)
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda (empty = local echo agent)
+      AWS_REGION: ${AWS_REGION:-} # region for S3, SQS and Lambda calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
+  worker-node:
+    build: { context: .., dockerfile: leaky_bucket/node/Dockerfile.worker } # context src/
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0 # password from .env
+      SQS_PREFIX: ${SQS_PREFIX:?set SQS_PREFIX in .env} # queue URL up to the language
+      RULES_BUCKET: ${RULES_BUCKET:-} # S3 bucket with rules (read once at start)
+      RULES_KEY: ${RULES_KEY:-rules.yaml} # S3 key of rules.yaml
+      BACKEND_FUNCTION: ${BACKEND_FUNCTION:-} # backend Lambda (empty = local echo agent)
+      AWS_REGION: ${AWS_REGION:-} # region for S3, SQS and Lambda calls
+    depends_on: { redis: { condition: service_healthy } } # wait for Redis
+    networks: [internal] # private network only
+    restart: unless-stopped # restart on crash or reboot
+  # --- Redis: door guard and bookkeeping (not the rate; the workers set that) -
+  redis:
+    image: redis:8.10.3-alpine # official Redis, small Alpine base
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} # used by the command and healthcheck below
+    # Start Redis with:
+    #   --requirepass       password required for every client
+    #   --save ""           no snapshots to disk (jobs are short-lived anyway)
+    #   --appendonly no     no write log either
+    #   --maxmemory 128mb   cap memory on the small EC2
+    #   --maxmemory-policy volatile-ttl  if full, drop only keys that have a TTL, closest to expiry
+    #                                    (jobs and line counts; the tiers hash and ticket
+    #                                    counters have no TTL, so they are never dropped)
+    command:
+      - sh # run through a shell...
+      - -c # ...so $REDIS_PASSWORD is read from the environment, not written here
+      - exec redis-server --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no --maxmemory 128mb --maxmemory-policy volatile-ttl # $$ = literal $ for the shell
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"] # healthy = answers PING with the password
+      interval: 5s # check every 5 s
+      timeout: 3s # each check may take 3 s
+      retries: 10 # unhealthy after 10 failures in a row
+    networks: [internal] # private network only; never published
+    restart: unless-stopped # restart on crash or reboot
+# Networks used above.
+networks:
+  internal: {} # private network shared by all services; Docker's DNS resolves service names

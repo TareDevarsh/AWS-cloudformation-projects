@@ -1,0 +1,22 @@
+# Node leaky bucket WORKER (the leak: starts jobs at a fixed rate).
+# Build context is src/ (one level above leaky_bucket/), same as the limiter image:
+#   docker build -f leaky_bucket/node/Dockerfile.worker -t worker-node .
+# Small official Node LTS image.
+FROM node:22-slim
+# All app files live in /app inside the container.
+WORKDIR /app
+# Copy the dependency files first, so Docker can cache the install step.
+COPY leaky_bucket/node/package.json leaky_bucket/node/package-lock.json ./
+# Install exactly what the lock file says (integrity-checked), no dev deps.
+RUN npm ci --omit=dev
+# The finish script and the default rules (the worker never uses the other scripts).
+COPY leaky_bucket/finish.lua leaky_bucket/rules.yaml ./
+# The worker code and the helpers it shares with the limiter.
+COPY leaky_bucket/node/common.js leaky_bucket/node/worker.js ./
+# No port at all: the worker only makes outgoing calls (Redis, SQS, Lambda).
+# The FINISH_LUA / RULES_FILE variables point at the files copied above.
+ENV LANGUAGE=node FINISH_LUA=/app/finish.lua RULES_FILE=/app/rules.yaml NODE_ENV=production
+# Run as the image's unprivileged "node" user, not root.
+USER node
+# Start the worker.
+CMD ["node", "worker.js"]

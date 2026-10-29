@@ -1,0 +1,26 @@
+# Python leaky bucket WORKER (the leak: starts jobs at a fixed rate).
+# Build context is src/ (one level above leaky_bucket/), same as the limiter image:
+#   docker build -f leaky_bucket/python/Dockerfile.worker -t worker-python .
+
+# Small official Python image (Debian slim, no extra tools).
+FROM python:3.12-slim
+
+# All app files live in /app inside the container.
+WORKDIR /app
+# Copy only the dependency list first, so Docker can cache the install step.
+COPY leaky_bucket/python/requirements.txt .
+# Install pinned dependencies; --no-cache-dir keeps the image smaller.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# The finish script and the default rules (the worker never uses the token bucket script).
+COPY leaky_bucket/finish.lua leaky_bucket/rules.yaml ./
+# The worker code and the helpers it shares with the limiter.
+COPY leaky_bucket/python/common.py leaky_bucket/python/worker.py ./
+
+# No port at all: the worker only makes outgoing calls (Redis, SQS, Lambda).
+# The FINISH_LUA / RULES_FILE variables point at the files copied above.
+ENV LANGUAGE=python FINISH_LUA=/app/finish.lua RULES_FILE=/app/rules.yaml
+# Run as an unprivileged user, not root.
+USER nobody
+# Start the worker. -u = unbuffered output, so log lines show up at once in "docker logs".
+CMD ["python", "-u", "worker.py"]

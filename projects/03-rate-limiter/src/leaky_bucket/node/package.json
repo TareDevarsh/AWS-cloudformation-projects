@@ -1,0 +1,21 @@
+{
+  "name": "leaky-bucket-node",
+  "version": "1.0.0",
+  "description": "Leaky bucket (queue) rate limiter and worker, Node version",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "worker": "node worker.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "3.1158.0",
+    "@aws-sdk/client-s3": "3.1158.0",
+    "@aws-sdk/client-sqs": "3.1158.0",
+    "ioredis": "5.11.1",
+    "js-yaml": "4.3.2"
+  }
+}

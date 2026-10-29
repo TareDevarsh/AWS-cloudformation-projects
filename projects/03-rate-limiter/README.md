@@ -21,7 +21,7 @@ The project is built in defined steps. Each step is designed and agreed before i
 | What it is | A rate limiter |
 | Middleware | One EC2 + Docker Compose: router, one limiter container per language, Redis |
 | Backend | AWS Lambda (stand-in for a real server, keeps testing cheap) |
-| Algorithm | Token bucket (bucket size, refill rate) |
+| Algorithms | Token bucket (bucket size, refill rate), deployed and measured. Leaky bucket as a queue (SQS FIFO + a worker at a fixed rate), built and tested locally, not deployed yet ([details](src/leaky_bucket/README.md)) |
 | Caller identity | User id + cookie + IP, layered: a request needs a token in every bucket ([details](docs/architecture.md#identifying-the-caller)) |
 | Rate limiter placement | Middleware between client and servers |
 | Token buckets | Redis container (Docker network only) |
@@ -92,14 +92,26 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 ├── infrastructure/
 │   └── template.yaml         ← CloudFormation stack
 ├── src/
-│   └── token_bucket/
-│       ├── README.md         ← how the token bucket works, Redis data model, memory sizing
-│       ├── token_bucket.lua  ← the algorithm (runs in Redis)
-│       ├── rules.yaml        ← rate limit rules
-│       ├── docker-compose.yml, router/nginx.conf
-│       └── python/ go/ node/ ← one limiter server per language
+│   ├── token_bucket/
+│   │   ├── README.md         ← how the token bucket works, Redis data model, memory sizing
+│   │   ├── CODE_STRUCTURE.md ← Merkle-tree map of the files
+│   │   ├── token_bucket.lua  ← the algorithm (runs in Redis)
+│   │   ├── rules.yaml        ← rate limit rules
+│   │   ├── docker-compose.yml, router/nginx.conf
+│   │   └── python/ go/ node/ ← one limiter server per language
+│   ├── leaky_bucket/
+│   │   ├── README.md         ← how the leaky bucket works, API, Redis data, retries, deploy and test
+│   │   ├── CODE_STRUCTURE.md ← Merkle-tree map of the files
+│   │   ├── accept.lua, finish.lua ← door guard and job bookkeeping (run in Redis)
+│   │   ├── rules.yaml        ← tiers, queue settings, poll limits
+│   │   ├── docker-compose.yml
+│   │   └── python/ go/ node/ ← one limiter server and one worker per language
+│   └── backend/handler.py    ← backend Lambda (token bucket call, plus chat mode for the leaky bucket)
 ├── tests/
-│   └── integration/          ← tests against the deployed stack
+│   └── integration/
+│       ├── latency.py        ← token bucket live test
+│       ├── leaky_latency.py  ← leaky bucket live test (bursts, polling, failure, p50/p90)
+│       └── sigv4.py          ← helper
 └── scripts/
     ├── deploy.sh             ← lint, package src/, deploy, print outputs
     └── destroy.sh            ← delete stack
@@ -115,6 +127,16 @@ python3 tests/integration/latency.py http://<PublicIp>:8080 100
 ./scripts/destroy.sh dev us-east-1         # deletes the stack and this stage's uploaded artifacts
 ```
 
+Leaky bucket (adds 6 SQS FIFO queues + 6 dead-letter queues; the third argument picks the algorithm and defaults to `token_bucket`):
+
+```bash
+cd projects/03-rate-limiter
+./scripts/deploy.sh dev us-east-1 leaky_bucket   # same flow; the template needs CAPABILITY_AUTO_EXPAND, which the script passes
+# Console: add ONE inbound rule to the SecurityGroupId output: TCP 8080, <your-ip>/32
+python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3    # 3 rounds per language
+./scripts/destroy.sh dev us-east-1
+```
+
 In org-managed accounts that deny `iam:DeleteRole`, `destroy.sh` keeps the two IAM roles (free, unused) so the stack still finishes deleting; it lists them so you can remove them later.
 
 Change only `rules.yaml` and re-run `deploy.sh`: the limiters pick it up within ~30 s without replacing the instance. Changing code replaces the instance (new public IP; your security group rule stays).
@@ -123,7 +145,7 @@ Change only `rules.yaml` and re-run `deploy.sh`: the limiters pick it up within 
 
 - **Cost:** EC2 billed hourly while up; delete the stack after each test.
 - **Access:** deliberate exception to the repo's IAM-auth default. Only the router port is open, to the owner's IP, added by hand (never stored in this repo). No SSH; SSM for shell. See [Security](docs/architecture.md#security).
-- **Least privilege:** instance role can only invoke the backend Lambda and read `rules.yaml`.
+- **Least privilege:** instance role can only invoke the backend Lambda and read `rules.yaml`. With the leaky bucket it may also use this stage's `rate-limiter-<stage>-*` SQS queues, and nothing else.
 - **Data:** test data only (plain HTTP). Redis is never published.
 
 ## What I learned / next steps
@@ -135,6 +157,14 @@ Done:
 - [x] nginx router + Docker Compose (Redis with password, one published port)
 - [x] CloudFormation: VPC, EC2 t3.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean)
 - [x] `deploy.sh` / `destroy.sh` and the live test `tests/integration/latency.py`
+
+Leaky bucket (queue):
+
+- [x] Design: SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed — [details](src/leaky_bucket/README.md)
+- [x] Lua scripts (`accept.lua`, `finish.lua`), limiter + worker in Python, Go and Node, Compose file
+- [x] CloudFormation: `Algorithm` parameter, SQS queues + dead-letter queues, role limited to those queues; `deploy.sh` third argument
+- [x] Live test script `tests/integration/leaky_latency.py` (checked against a local stand-in only)
+- [ ] Deploy with `leaky_bucket`, run the live test, record the leaky bucket latency (results section in its README is still empty)
 
 Left to build:
 

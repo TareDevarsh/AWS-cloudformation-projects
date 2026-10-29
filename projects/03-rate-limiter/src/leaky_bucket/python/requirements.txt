@@ -1,0 +1,8 @@
+# ASGI server that runs app.py (the worker does not use it)
+uvicorn==0.54.0
+# Redis client (async), runs the Lua scripts via EVALSHA
+redis==8.1.0
+# AWS SDK: reads rules from S3, sends/receives SQS messages, invokes the backend Lambda
+boto3==1.43.120
+# Parses rules.yaml
+PyYAML==6.0.3

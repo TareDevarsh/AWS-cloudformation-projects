@@ -1,0 +1,51 @@
+# Rules for the leaky bucket (queue) limiter and its workers.
+# Uploaded to S3 on deploy. Limiters keep a copy in memory and re-read it only
+# when the S3 ETag changes. Workers read it once at start (restart to apply).
+#
+# Tiers: a user's tier is a small number (0-255) stored in the Redis hash
+# "tiers" (user id -> tier). Users not in the hash are tier 0. To add a tier:
+# add an entry under "tiers" below, and add its queue to the CloudFormation
+# template (one more item in the tier list).
+
+# How jobs wait in the SQS FIFO queues.
+queue:
+  retention_s: 120 # a waiting job is dropped by SQS after 2 minutes; polls then say "expired"
+  max_attempts: 5 # a job whose backend call failed 5 times is marked "failed"
+  visibility_timeout_s: 10 # a received job stays hidden this long; short, so a stuck one comes back soon
+  retry_visibility_s: 1 # after a backend error, hide the job only 1 s so it is retried quickly
+
+# Limit on how often a client may poll GET /result/{job_id}.
+# These use the same token bucket script as the token bucket limiter.
+poll:
+  job: # one bucket per job id (key: poll-u<job id>)
+    bucket_size: 3 # burst of up to 3 polls
+    refill_rate: 1 # then 1 poll per second (what the client does)
+  user: # one bucket per user across all their jobs (key: pollu-u<user>)
+    bucket_size: 20 # burst of up to 20 polls
+    refill_rate: 10 # then 10 polls per second
+
+# The fake chat agent takes this long to answer. Sent to the backend Lambda.
+agent_sleep_ms: 200 # 200 ms per request, so a business tier at 5/s keeps up
+
+# One entry per tier. Each tier has its own queue (its own line).
+tiers:
+  - id: 0 # tier number; 0 is the fallback and must exist
+    name: regular # label for logs and docs only
+    leak_rate: 1 # jobs started per second (the worker's pace)
+    max_waiting: 3 # jobs one user may have waiting at once; more gets 429
+
+  - id: 1 # tier number
+    name: business # label for logs and docs only
+    leak_rate: 5 # 5 jobs started per second
+    max_waiting: 10 # up to 10 waiting per user
+
+# TEST ONLY. Users written into the Redis "tiers" hash when a limiter starts
+# (HSET, safe to repeat), so the tests have business users to use.
+# In real use the tier would come from the user's verified account, never from
+# a file, and this list would be empty or removed.
+seed_tiers:
+  biz1: 1 # user biz1 is tier 1 (business)
+  biz2: 1 # user biz2 is tier 1
+  biz3: 1 # user biz3 is tier 1
+  biz4: 1 # user biz4 is tier 1
+  biz5: 1 # user biz5 is tier 1
