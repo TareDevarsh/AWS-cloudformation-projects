@@ -7,7 +7,7 @@
 
 [← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
 
-<!-- Architecture image (docs/images/architecture.png) added once the design is decided. -->
+![Architecture](docs/images/architecture.png)
 
 ## Summary
 

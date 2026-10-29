@@ -23,6 +23,10 @@ Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 <td width="50%" align="center"><a href="projects/01-key-value-store/"><img src="projects/01-key-value-store/docs/images/architecture.png" alt="01 Key-Value Store architecture"/></a><br/><b><a href="projects/01-key-value-store/">01 · Key-Value Store</a></b></td>
 <td width="50%" align="center"><a href="projects/02-ad-creative-scorer/"><img src="projects/02-ad-creative-scorer/docs/images/architecture.png" alt="02 Ad Creative Scorer architecture"/></a><br/><b><a href="projects/02-ad-creative-scorer/">02 · Ad Creative Scorer</a></b></td>
 </tr>
+<tr>
+<td width="50%" align="center"><a href="projects/03-rate-limiter/"><img src="projects/03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="projects/03-rate-limiter/">03 · Rate Limiter</a></b></td>
+<td width="50%"></td>
+</tr>
 </table>
 
 ## Portfolio map

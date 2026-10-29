@@ -1,6 +1,6 @@
 # Architecture · 03 Rate Limiter
 
-[← Project README](../README.md) · [Workflows](workflow.md)
+[← Project README](../README.md) · [Architecture image](images/architecture.png) · [Workflows](workflow.md)
 
 This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](../src/token_bucket/README.md), [leaky bucket](../src/leaky_bucket/README.md)).
 
