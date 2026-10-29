@@ -1,9 +1,9 @@
 # 03 · Rate Limiter
 
-![Status](https://img.shields.io/badge/status-planned-lightgrey)
+![Status](https://img.shields.io/badge/status-prototype-yellow)
 ![IaC](https://img.shields.io/badge/IaC-CloudFormation-FF4F8B?logo=amazonaws&logoColor=white)
 ![Access](https://img.shields.io/badge/access-owner%20IP%20only-orange)
-![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![Languages](https://img.shields.io/badge/limiters-Python%20%C2%B7%20Go%20%C2%B7%20Node-3776AB)
 
 [← Portfolio](../../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
 
@@ -11,25 +11,22 @@
 
 ## Summary
 
-We are building a rate limiter. It runs as middleware on one EC2 instance with Docker Compose, keeps token buckets in Redis, and forwards allowed requests to a Lambda backend (a cheap stand-in for a real server). The rate limiter is middleware that sits between the client and the servers ([why](docs/architecture.md#where-the-rate-limiter-sits)). One requirement holds from the start: **latency is measured at every step**. Every time we call the setup on AWS, we record what latency the system adds, so each step of the build comes with numbers.
+A rate limiter that sits **between the client and the servers** ([why there](docs/architecture.md#where-the-rate-limiter-sits)). It runs on one EC2 with Docker Compose, keeps its counters in Redis, and sends allowed requests to a Lambda backend (a cheap stand-in for a real server). Rule one: **measure the latency at every step**.
 
-The project is built in defined steps. Each step is designed and agreed before it is implemented.
+The project is built in small steps. Each step is designed and agreed before it's built.
 
 | Fact | Value |
 |------|-------|
-| Status | ⚪ Planned |
-| What it is | A rate limiter |
-| Middleware | One EC2 + Docker Compose: router, one limiter container per language, Redis |
-| Backend | AWS Lambda (stand-in for a real server, keeps testing cheap) |
-| Algorithms | Token bucket (bucket size, refill rate), deployed and measured. Leaky bucket as a queue (SQS FIFO + a worker at a fixed rate), built and tested locally, not deployed yet ([details](src/leaky_bucket/README.md)) |
-| Caller identity | User id + cookie + IP, layered: a request needs a token in every bucket ([details](docs/architecture.md#identifying-the-caller)) |
-| Rate limiter placement | Middleware between client and servers |
-| Token buckets | Redis container (Docker network only) |
-| Rules | S3 `rules.yaml`, held in limiter memory, refreshed by ETag |
-| Latency | Measured at every step, for every call to the AWS setup |
-| Access | Public IP, security group allows the owner's IP only (added by hand after deploy). No auth; short-lived test only ([details](docs/architecture.md#security)) |
+| Status | 🟡 Prototype: token bucket deployed and measured; leaky bucket built, not deployed yet |
+| Where it runs | One EC2 (t3.small) + Docker Compose: nginx router, one limiter per language, Redis |
+| Languages | Python, Go, Node (same algorithm, compared side by side) |
+| Algorithms | [Token bucket](src/token_bucket/README.md) · [Leaky bucket (SQS queue)](src/leaky_bucket/README.md) |
+| Who is limited | User id + cookie + IP, checked together ([details](docs/architecture.md#identifying-the-caller)) |
+| Rules | `rules.yaml` in S3, kept in limiter memory, re-read when it changes |
+| Backend | AWS Lambda (stand-in for a real server) |
+| Access | Public IP, but only the owner's IP is allowed (added by hand). No auth, short-lived test only ([details](docs/architecture.md#security)) |
 | Infra as code | [`infrastructure/template.yaml`](infrastructure/template.yaml) |
-| Cost at idle | $0 once the stack is deleted; small hourly EC2 cost while running |
+| Cost | $0 once deleted; small hourly EC2 cost while running |
 
 ## Architecture
 
@@ -43,19 +40,21 @@ flowchart TB
             direction LR
             PY[limiter-python] ~~~ GO[limiter-go] ~~~ ND[limiter-node]
         end
-        Redis[(redis · token buckets)]
+        Redis[(redis · counters)]
         Router -- "/python · /go · /node" --> LIM
-        LIM -- "take token · Lua, atomic" --> Redis
+        LIM -- "one atomic Lua call" --> Redis
     end
     Client -- "HTTP · your IP only" --> Router
-    Router -. "429 if no token" .-> Client
+    Router -. "429 if over the limit" .-> Client
     LIM -- "allowed" --> Backend[Backend · Lambda]
-    S3[(S3 · rules.yaml)] -. "ETag refresh" .-> LIM
+    S3[(S3 · rules.yaml)] -. "re-read when changed" .-> LIM
 ```
+
+The leaky bucket adds SQS queues and one worker per language to this picture: see [its diagram](src/leaky_bucket/README.md#how-it-works).
 
 ## Latency
 
-Latency is tracked at every step of the build. Each step adds a row here.
+Every step adds a row here.
 
 | Step | What changed | Latency | Notes |
 |------|--------------|---------|-------|
@@ -75,9 +74,20 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 
 ## How it works
 
-Defined step by step as the project is built.
+| Step | What happens |
+|------|--------------|
+| 1 | You call `http://<ip>:8080/<language>/...`. nginx sends it to that language's limiter. |
+| 2 | The limiter works out who you are (user id, cookie, IP) and which rules apply. |
+| 3 | One Redis call runs the algorithm's Lua script on all your counters at once. |
+| 4 | Allowed → the request goes to the backend. Not allowed → `429` + `Retry-After`. |
+| 5 | Every response has a `Server-Timing` header showing where the time went. |
 
-More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/architecture.md](docs/architecture.md).
+| Read next | For |
+|-----------|-----|
+| [docs/architecture.md](docs/architecture.md) | Placement, identity, rules, security, all decisions |
+| [docs/workflow.md](docs/workflow.md) | Deploy → boot → test → destroy, step by step |
+| [Token bucket README](src/token_bucket/README.md) | Algorithm 1, its Redis data and memory sizing |
+| [Leaky bucket README](src/leaky_bucket/README.md) | Algorithm 2, the queue, API and retries |
 
 ## Repo layout
 
@@ -86,7 +96,7 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 ├── README.md                 ← this file
 ├── docs/
 │   ├── architecture.md       ← placement, routing, identity, security, decisions
-│   ├── workflow.md           ← sequence + state diagrams, deploy lifecycle
+│   ├── workflow.md           ← deploy lifecycle and request flow
 │   ├── diagram.py            ← diagram-as-code (AWS icons)
 │   └── images/architecture.png
 ├── infrastructure/
@@ -119,55 +129,49 @@ More detail: [docs/workflow.md](docs/workflow.md). Design decisions: [docs/archi
 
 ## Deploy / Test / Teardown
 
-```bash
-cd projects/03-rate-limiter
-./scripts/deploy.sh dev us-east-1          # uploads code + rules, deploys, waits until all limiters are healthy (~5-15 min)
-# Console: add ONE inbound rule to the SecurityGroupId output: TCP 8080, <your-ip>/32
-python3 tests/integration/latency.py http://<PublicIp>:8080 100
-./scripts/destroy.sh dev us-east-1         # deletes the stack and this stage's uploaded artifacts
-```
+The third `deploy.sh` argument picks the algorithm (default `token_bucket`). Step-by-step manual version: [docs/workflow.md](docs/workflow.md).
 
-Leaky bucket (adds 6 SQS FIFO queues + 6 dead-letter queues; the third argument picks the algorithm and defaults to `token_bucket`):
+| Step | Token bucket | Leaky bucket |
+|------|--------------|--------------|
+| 1. Deploy (~5–15 min) | `./scripts/deploy.sh dev us-east-1` | `./scripts/deploy.sh dev us-east-1 leaky_bucket` |
+| 2. Allow your IP | Console: add ONE inbound rule to the `SecurityGroupId` output: TCP 8080, `<your-ip>/32` | same |
+| 3. Test | `python3 tests/integration/latency.py http://<PublicIp>:8080 100` | `python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3` (3 rounds per language) |
+| 4. Tear down | `./scripts/destroy.sh dev us-east-1` | same |
 
-```bash
-cd projects/03-rate-limiter
-./scripts/deploy.sh dev us-east-1 leaky_bucket   # same flow; the template needs CAPABILITY_AUTO_EXPAND, which the script passes
-# Console: add ONE inbound rule to the SecurityGroupId output: TCP 8080, <your-ip>/32
-python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3    # 3 rounds per language
-./scripts/destroy.sh dev us-east-1
-```
+Run from `projects/03-rate-limiter`.
 
-In org-managed accounts that deny `iam:DeleteRole`, `destroy.sh` keeps the two IAM roles (free, unused) so the stack still finishes deleting; it lists them so you can remove them later.
-
-Change only `rules.yaml` and re-run `deploy.sh`: the limiters pick it up within ~30 s without replacing the instance. Changing code replaces the instance (new public IP; your security group rule stays).
+| Good to know | |
+|--------------|---|
+| Leaky bucket extras | Adds 6 SQS FIFO queues + 6 dead-letter queues. The template needs `CAPABILITY_AUTO_EXPAND`, which the script passes. |
+| Change only `rules.yaml` | Re-run `deploy.sh`; limiters pick it up within ~30 s, no instance replacement. |
+| Change code | The instance is replaced (new public IP; your security group rule stays). |
+| Org-managed accounts | If `iam:DeleteRole` is denied, `destroy.sh` keeps the two IAM roles (free, unused) so the stack still finishes deleting, and lists them so you can remove them later. |
 
 ## Cost & security notes
 
-- **Cost:** EC2 billed hourly while up; delete the stack after each test.
-- **Access:** deliberate exception to the repo's IAM-auth default. Only the router port is open, to the owner's IP, added by hand (never stored in this repo). No SSH; SSM for shell. See [Security](docs/architecture.md#security).
-- **Least privilege:** instance role can only invoke the backend Lambda and read `rules.yaml`. With the leaky bucket it may also use this stage's `rate-limiter-<stage>-*` SQS queues, and nothing else.
-- **Data:** test data only (plain HTTP). Redis is never published.
+| Topic | Note |
+|-------|------|
+| Cost | EC2 billed hourly while up; delete the stack after each test. |
+| Access | Deliberate exception to the repo's IAM-auth default. Only the router port is open, to the owner's IP, added by hand (never stored in this repo). No SSH; SSM for shell. See [Security](docs/architecture.md#security). |
+| Least privilege | Instance role can only invoke the backend Lambda and read `rules.yaml`. With the leaky bucket it may also use this stage's `rate-limiter-<stage>-*` SQS queues, and nothing else. |
+| Data | Test data only (plain HTTP). Redis is never published. |
 
 ## What I learned / next steps
 
-Done:
+| Done | |
+|------|---|
+| ✅ Token bucket | Lua, multi-bucket, all-or-nothing ([details](src/token_bucket/README.md)) |
+| ✅ Limiter servers | Python, Go, Node |
+| ✅ Router + Compose | nginx, Redis with a password, one published port |
+| ✅ CloudFormation | VPC, EC2 t3.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean) |
+| ✅ Scripts + live test | `deploy.sh`, `destroy.sh`, `tests/integration/latency.py` |
+| ✅ Token bucket live run | Deployed, tested, step 1 latency recorded |
+| ✅ Leaky bucket design | SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed ([details](src/leaky_bucket/README.md)) |
+| ✅ Leaky bucket code | `accept.lua`, `finish.lua`, limiter + worker in 3 languages, Compose, `Algorithm` parameter, queues + dead-letter queues, `deploy.sh` third argument |
+| ✅ Leaky bucket test script | `tests/integration/leaky_latency.py` (checked against a local stand-in only) |
 
-- [x] Token bucket algorithm (Lua, multi-bucket, all-or-nothing) — [details](src/token_bucket/README.md)
-- [x] Limiter servers: Python (tested locally), Node (logic tested), Go (first build on EC2)
-- [x] nginx router + Docker Compose (Redis with password, one published port)
-- [x] CloudFormation: VPC, EC2 t3.small, security group (no inbound), instance role, backend Lambda (cfn-lint clean)
-- [x] `deploy.sh` / `destroy.sh` and the live test `tests/integration/latency.py`
-
-Leaky bucket (queue):
-
-- [x] Design: SQS FIFO per language and tier, the worker sets the rate, Redis is the door guard, 2 minute retention, 5 attempts then failed — [details](src/leaky_bucket/README.md)
-- [x] Lua scripts (`accept.lua`, `finish.lua`), limiter + worker in Python, Go and Node, Compose file
-- [x] CloudFormation: `Algorithm` parameter, SQS queues + dead-letter queues, role limited to those queues; `deploy.sh` third argument
-- [x] Live test script `tests/integration/leaky_latency.py` (checked against a local stand-in only)
-- [ ] Deploy with `leaky_bucket`, run the live test, record the leaky bucket latency (results section in its README is still empty)
-
-Left to build:
-
-- [x] Deployed, ran live tests, recorded step 1 latency
-- [ ] Update `docs/diagram.py` + render `architecture.png`, `docs/workflow.md`
-- [ ] Phase 2: scale out (more instances, ElastiCache), more algorithms
+| Next | |
+|------|---|
+| ⬜ Leaky bucket live run | Deploy with `leaky_bucket`, run the live test, record its latency |
+| ⬜ Diagrams | Update `docs/diagram.py` + render `architecture.png` |
+| ⬜ Phase 2 | Scale out (more instances, ElastiCache), more algorithms |

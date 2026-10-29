@@ -14,7 +14,7 @@ Every project lives in [`projects/`](projects/) and is self-contained: it has it
 |---|---------|---------------|--------------|--------|
 | 01 | [**Key-Value Store**](projects/01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](projects/02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
-| 03 | [**Rate Limiter**](projects/03-rate-limiter/) | Rate limiter middleware (token bucket in Redis) in front of a Lambda backend, latency measured at every step | EC2 · Docker · Redis · S3 · Lambda | ⚪ Planned |
+| 03 | [**Rate Limiter**](projects/03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket (Redis) and leaky bucket (SQS queue), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -43,6 +43,8 @@ Every entry below is a link, so you can jump straight to the file.
   - 📦 **[03 · Rate Limiter](projects/03-rate-limiter/)**
     - [Architecture](projects/03-rate-limiter/docs/architecture.md) · [Workflows](projects/03-rate-limiter/docs/workflow.md)
     - [Template](projects/03-rate-limiter/infrastructure/template.yaml) · [Code](projects/03-rate-limiter/src/) · [Scripts](projects/03-rate-limiter/scripts/)
+    - Algorithms: [Token bucket](projects/03-rate-limiter/src/token_bucket/README.md) · [Leaky bucket](projects/03-rate-limiter/src/leaky_bucket/README.md)
+    - [Live tests](projects/03-rate-limiter/tests/integration/)
 
 ```mermaid
 mindmap
@@ -95,12 +97,12 @@ aws-projects/
 │   │   ├── tests/integration/
 │   │   └── scripts/             ← deploy.sh, train.sh, destroy.sh
 │   └── 03-rate-limiter/
-│       ├── README.md            ← goal, latency log
-│       ├── docs/
-│       ├── infrastructure/
-│       ├── src/
-│       ├── tests/integration/
-│       └── scripts/
+│       ├── README.md            ← summary, latency log
+│       ├── docs/                ← architecture.md, workflow.md
+│       ├── infrastructure/      ← template.yaml (Algorithm parameter)
+│       ├── src/                 ← token_bucket/, leaky_bucket/, backend/
+│       ├── tests/integration/   ← latency.py, leaky_latency.py
+│       └── scripts/             ← deploy.sh, destroy.sh
 └── .kiro/steering/              ← keeps Kiro/MCP following these conventions
 ```
 
@@ -122,6 +124,12 @@ graph TD
     W1 --> S1[scripts + tests]
     W2 --> S2[scripts + tests]
     P3 --> A3[architecture.md] & W3[workflow.md]
+    A3 --> TB[token_bucket/README.md]
+    A3 --> LB[leaky_bucket/README.md]
+    TB --> TBC[CODE_STRUCTURE.md]
+    LB --> LBC[CODE_STRUCTURE.md]
+    A3 --> I3[infrastructure/template.yaml]
+    W3 --> S3[scripts + tests]
 ```
 
 ## Reading guide (for reviewers)

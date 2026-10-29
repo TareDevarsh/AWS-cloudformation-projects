@@ -2,7 +2,10 @@
 
 [← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Lua script](token_bucket.lua) · [Rules](rules.yaml) · [Code structure](CODE_STRUCTURE.md)
 
-The first rate limiting algorithm in this project. Every language server (Python, Go, Node) uses the same Lua script inside Redis, so the algorithm is identical and only the server wrapper differs.
+The first rate limiting algorithm. All three language servers (Python, Go, Node) run the same Lua script inside Redis, so the algorithm is identical and only the server around it differs.
+
+| Status | Deployed and measured ([results](../../README.md#latency)) |
+|---|---|
 
 ## How it works
 
@@ -18,9 +21,10 @@ flowchart LR
     Check -- "no" --> Deny[429 Too Many Requests]
 ```
 
-- **Bucket size** sets the largest burst allowed at once.
-- **Refill rate** sets the steady rate allowed over time.
-- Example: size 10, rate 5/s. A caller can send 10 requests at once, then about 5 per second after that.
+| Setting | Controls | Example (size 10, rate 5/s) |
+|---------|----------|-----------------------------|
+| Bucket size | The largest burst allowed at once | 10 requests at once |
+| Refill rate | The steady rate allowed over time | then about 5 per second |
 
 ## The Lua script
 
@@ -38,7 +42,17 @@ Returns `[allowed, remaining, retry_after_ms, denied_by]`; the server turns a de
 
 ## Rules
 
-One rule per thing we limit. Each token bucket rule has the two variables: bucket size and refill rate.
+One rule per thing we limit. Each rule has the two settings: bucket size and refill rate.
+
+| Rule | Limits | Size | Refill/s |
+|------|--------|------|----------|
+| `user` | Each logged-in user, every path | 10 | 5 |
+| `cookie` | Each logged-out visitor (no user id), every path | 5 | 2 |
+| `ip` | Each client IP, every path (looser: IPs are shared) | 20 | 10 |
+| `login` | Each IP on `/login` | 5 | 0.1 (1 every 10 s) |
+
+<details><summary>The rules as YAML</summary>
+
 
 ```yaml
 rules:
@@ -68,6 +82,8 @@ rules:
     refill_rate: 0.1       # 1 token every 10 s
 ```
 
+</details>
+
 A rule matches on both the caller (`key`) and the endpoint (`path`). How callers are identified: [Identifying the caller](../../docs/architecture.md#identifying-the-caller). The live file is [`rules.yaml`](rules.yaml).
 
 ## Data model (Redis)
@@ -90,9 +106,11 @@ erDiagram
 | `ts` | Microseconds, Redis server clock | `1761580000123456` |
 | Expiry | Auto-deleted once the bucket would be full again | size 10, rate 5/s → 2 s |
 
-- `<rule>` is the rule's short `id` from `rules.yaml` (lowercase letters and digits only, no `-`, so the key stays unambiguous).
-- `<caller>` is the user id, the session cookie id, or for IP rules the IPv4 address as a number. IPv6 falls back to the address text.
-- Field names are one or two letters to save memory per user.
+| Key part | Rule |
+|----------|------|
+| `<rule>` | The rule's short `id` from `rules.yaml`: lowercase letters and digits only, no `-`, so a key can't be read two ways |
+| `<caller>` | The user id, the session cookie id, or for IP rules the IPv4 address as a number (IPv6 falls back to the address text) |
+| Field names | One or two letters, to save memory per user |
 
 ## Capacity planning (Redis memory)
 
@@ -162,12 +180,19 @@ A caller uses ~2 buckets, not 4: `user` or `cookie` (never both) + `ip`, plus `l
 
 **If it's not enough:**
 
-- Smaller buckets: already done (short keys, whole-number tokens).
-- More memory: a bigger instance or ElastiCache node.
-- Split Redis across servers (Redis Cluster). Catch: one request checks `user-…` and `ip-…` together, but those keys may land on different servers, so the all-or-nothing check would need redesigning.
-- Don't shorten the expiry: deleting a bucket early gives that caller free requests.
+| Option | Notes |
+|--------|-------|
+| Smaller buckets | Already done (short keys, whole-number tokens) |
+| More memory | A bigger instance or ElastiCache node |
+| Split Redis across servers (Redis Cluster) | Catch: one request checks `user-…` and `ip-…` together, but those keys may land on different servers, so the all-or-nothing check would need redesigning |
+| Shorten the expiry | Don't: deleting a bucket early gives that caller free requests |
 
-**If Redis does run out of memory:** we use `volatile-ttl`, so Redis deletes the buckets closest to expiring. A deleted bucket comes back full, so that caller may get a few extra requests, but nobody is blocked by mistake. (The alternative, `noeviction`, refuses new writes, so the limiter would return errors instead.)
+**If Redis does run out of memory:**
+
+| Policy | What happens |
+|--------|--------------|
+| `volatile-ttl` (ours) | Redis deletes the buckets closest to expiring. A deleted bucket comes back full, so that caller may get a few extra requests, but nobody is blocked by mistake |
+| `noeviction` (not used) | Redis refuses new writes, so the limiter would return errors instead |
 
 ## Files
 

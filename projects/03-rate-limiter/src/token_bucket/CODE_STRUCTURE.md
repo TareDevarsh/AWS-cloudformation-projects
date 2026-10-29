@@ -8,7 +8,7 @@ A map of every file in this folder, drawn as a Merkle tree: each file has a fing
 
 ```mermaid
 flowchart LR
-    ROOT["token_bucket/<br/>f8013197"]
+    ROOT["token_bucket/<br/>15aa66c0"]
 
     ROOT --> SHARED["Shared by all languages"]
     ROOT --> PY["python/<br/>b2bc9186"]
@@ -35,7 +35,7 @@ flowchart LR
     RT --> NGX["nginx.conf · efdb8e99<br/>routes /python /go /node"]
 ```
 
-"Shared by all languages" is a grouping for reading only; those files sit directly in `token_bucket/`. `README.md` (aeed7e7a) is also part of the root hash.
+"Shared by all languages" is a grouping for reading only; those files sit directly in `token_bucket/`. `README.md` (542ab97f) is also part of the root hash.
 
 ## What each file does
 

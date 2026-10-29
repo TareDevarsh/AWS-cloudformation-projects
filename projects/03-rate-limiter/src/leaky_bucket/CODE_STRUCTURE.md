@@ -8,7 +8,7 @@ A map of every file in this folder, drawn as a Merkle tree: each file has a fing
 
 ```mermaid
 flowchart LR
-    ROOT["leaky_bucket/<br/>bf10ef02"]
+    ROOT["leaky_bucket/<br/>1caa7dc9"]
 
     ROOT --> SHARED["Shared by all languages"]
     ROOT --> PY["python/<br/>59fe6b8d"]
@@ -40,7 +40,7 @@ flowchart LR
     ND --> NDPKG["package.json · 54220b84<br/>package-lock.json · 2d93ebc5"]
 ```
 
-"Shared by all languages" is a grouping for reading only; those files sit directly in `leaky_bucket/`. `README.md` (3a2221f5) is also part of the root hash. The nginx config and `token_bucket.lua` are **not** in this folder: the compose file and the Dockerfiles reuse the ones in [`../token_bucket/`](../token_bucket/CODE_STRUCTURE.md).
+"Shared by all languages" is a grouping for reading only; those files sit directly in `leaky_bucket/`. `README.md` (a7e0c6cd) is also part of the root hash. The nginx config and `token_bucket.lua` are **not** in this folder: the compose file and the Dockerfiles reuse the ones in [`../token_bucket/`](../token_bucket/CODE_STRUCTURE.md).
 
 ## What each file does
 

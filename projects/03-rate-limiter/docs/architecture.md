@@ -1,71 +1,42 @@
 # Architecture · 03 Rate Limiter
 
-[← Project README](../README.md) · [Architecture image](images/architecture.png)
+[← Project README](../README.md) · [Workflows](workflow.md)
 
-## Components
-
-```mermaid
-flowchart TB
-    subgraph AWS["AWS account (stack: rate-limiter-&lt;stage&gt;)"]
-        A[Component] --> B[Component]
-    end
-```
-
-| Logical ID | Type | Purpose |
-|------------|------|---------|
-| | | |
+This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](../src/token_bucket/README.md), [leaky bucket](../src/leaky_bucket/README.md)).
 
 ## Where the rate limiter sits
 
-We considered three places for the rate limiter.
-
 ```mermaid
 flowchart LR
-    subgraph A["1 · Client side"]
-        C1[Client + limiter] --> S1[Lambda backend]
+    subgraph A["Client side"]
+        C1[Client + limiter] --> S1[Backend]
     end
-    subgraph B["2 · Server side"]
-        C2[Client] --> S2[Lambda backend + limiter]
+    subgraph B["Server side"]
+        C2[Client] --> S2[Backend + limiter]
     end
-    subgraph M["3 · Middleware (chosen)"]
-        C3[Client] --> RL[Rate limiter middleware] --> S3[Lambda backend]
+    subgraph M["Middleware (chosen)"]
+        C3[Client] --> RL[Rate limiter] --> S3[Backend]
     end
 ```
 
-### 1. Client side
+| | Client side | Server side (inside the backend) | **Middleware (chosen)** |
+|---|---|---|---|
+| Can the caller bypass it? | Yes: the client controls the code, and other callers (scripts, curl, other SDKs) ignore it | No | No |
+| Rejected requests reach the backend? | Yes | Yes: every request runs the backend first. On Lambda that's a paid invocation and used concurrency | **No: only allowed traffic gets through** |
+| Protects against floods? | No | No: a spike still uses up backend capacity before being rejected | Yes |
+| Shared counters | n/a | Needed: many stateless copies (e.g. Lambda), so in-memory counts are wrong and must live in an external store, adding a hop | Needed once it runs on more than one instance |
+| Race conditions | n/a | Copies update one counter at once, so increments must be atomic | Same, solved with atomic Lua in Redis |
+| Coupling | n/a | Limit logic mixed with business logic; every service repeats it; changing a limit means redeploying | Limits live in one place |
+| Good for | Being polite only | | Enforcing limits |
 
-The client limits its own requests.
+What we accept with middleware, and measure:
 
-- Unreliable. The client controls the code, so it can change or skip the limiter.
-- Any caller that doesn't use our client (scripts, curl, other SDKs) ignores it completely.
-- Good only for being polite to the server. It can't enforce anything.
+| Trade-off | What it means |
+|-----------|---------------|
+| Extra hop | Every request passes through it. This is the latency we track at every step. |
+| Critical dependency | It must scale with traffic, and we must choose fail open or fail closed (parked for now). |
 
-### 2. Server side (inside the backend)
-
-The backend checks the limit before doing the work.
-
-- **Extra server load.** Every request runs the backend, including the ones we end up rejecting. With Lambda, that means rejected requests still cost an invocation and use up concurrency.
-- **No protection against floods.** Abusive traffic still reaches the backend before it's rejected, so a spike can still exhaust Lambda concurrency or downstream resources.
-- **Shared state is needed.** Lambda is stateless and runs many instances at once, so in-memory counters are per instance and wrong. The counts must live in an external store (for example DynamoDB or ElastiCache), which adds a network hop to every request.
-- **Race conditions.** Concurrent instances update the same counter, so increments must be atomic or the limit is exceeded.
-- **Coupling.** Limiter logic is mixed with business logic. Every service has to reimplement it, and changing a limit means redeploying the backend.
-
-### 3. Middleware (chosen)
-
-A separate rate limiter sits between the client and the servers. Requests over the limit are rejected before they reach the backend.
-
-- The client can't bypass it.
-- The backend only sees allowed traffic.
-- Limits live in one place, separate from business logic.
-
-Trade-offs we accept and will measure:
-
-- An extra hop on every request. This is the latency we track at every step.
-- The middleware becomes a critical dependency. It must scale with traffic, and we must decide what happens if it fails (fail open or fail closed).
-- It still needs shared state for counters if it runs on more than one instance.
-
-
-## High-level architecture
+## The setup
 
 ```mermaid
 flowchart TB
@@ -77,28 +48,34 @@ flowchart TB
             direction LR
             PY[limiter-python] ~~~ GO[limiter-go] ~~~ ND[limiter-node]
         end
-        Redis[(redis · token buckets)]
+        Redis[(redis · counters)]
         Router -- "/python · /go · /node" --> LIM
-        LIM -- "take token · Lua, atomic" --> Redis
+        LIM -- "one atomic Lua call" --> Redis
     end
     Client -- "HTTP · your IP only" --> Router
-    Router -. "429 if no token" .-> Client
+    Router -. "429 if over the limit" .-> Client
     LIM -- "allowed" --> Backend[Backend · Lambda]
-    S3[(S3 · rules.yaml)] -. "ETag refresh" .-> LIM
+    S3[(S3 · rules.yaml)] -. "re-read when changed" .-> LIM
 ```
 
-| Piece | Job | Hot path? |
-|-------|-----|-----------|
+| Piece | Job | On every request? |
+|-------|-----|-------------------|
 | EC2 | One small x86 instance (t3.small) running Docker Compose. Deleted after each test | Yes |
-| Router | nginx container. Single published port (8080). Routes `/python/...`, `/go/...`, `/node/...` to the matching limiter container | Yes, small fixed hop |
-| Rate limiter (per language) | Matches the request to a rule (in memory), takes a token from Redis, forwards or rejects | Yes |
-| Redis | Holds the live token count per bucket ([data model](../src/token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |
-| S3 | Source of truth for the rules (`rules.yaml`) | No |
+| Router | nginx container. The only published port (8080). Routes `/python/...`, `/go/...`, `/node/...` to the matching limiter | Yes, small fixed hop |
+| Limiter (per language) | Finds the rule (in memory), asks Redis, forwards or rejects | Yes |
+| Redis | Holds the live counters ([token bucket data](../src/token_bucket/README.md#data-model-redis)). Docker network only, never published, password required | Yes, one round trip |
+| S3 | The source of truth for the rules (`rules.yaml`) | No |
 | Backend | Lambda stand-in for a real server. Called with the EC2 instance role (SigV4). Only sees allowed requests | Only when allowed |
+| SQS + workers | Leaky bucket only: the queue and the fixed-rate workers ([diagram](../src/leaky_bucket/README.md#how-it-works)) | Leaky bucket only |
 
-Rule format and the example rules: [token bucket README](../src/token_bucket/README.md#rules).
+Rule format and example rules: [token bucket rules](../src/token_bucket/README.md#rules).
 
-Why not Lambda for the middleware: the real middleware is a long-running server. Lambda adds cold starts, has no shared memory between copies, and needs a VPC to reach Redis, so its numbers would mostly measure Lambda.
+| Why not Lambda for the limiter? | |
+|---|---|
+| Cold starts | Add latency that a real long-running server doesn't have |
+| No shared memory | Each copy has its own memory |
+| Needs a VPC | To reach Redis |
+| Result | The numbers would mostly measure Lambda, not the limiter |
 
 ## Identifying the caller
 
@@ -115,15 +92,15 @@ Why not Lambda for the middleware: the real middleware is a long-running server.
 | Device id | Mobile app install id | Yes: reinstall | Mobile apps |
 | Global (no caller) | Nothing | n/a | Capping total backend load |
 
-Watch-outs:
+| Watch out for | Why |
+|---------------|-----|
+| Raw headers (`X-User-Id`, `X-Forwarded-For`) | The client can set them to anything. Trust only verified ids, or the IP our own nginx records. |
+| Shared IPs | One IP can hide thousands of users (office, school, mobile carrier), so IP limits should be looser. |
+| Device fingerprinting | Identifying users from browser/device traits without consent is a privacy problem. Not used. |
 
-- Raw headers (`X-User-Id`, `X-Forwarded-For`) can be set to anything by the client. Trust only verified ids, or the IP our own nginx records.
-- One IP can hide thousands of users (office, school, mobile carrier), so IP limits should be looser.
-- Device fingerprinting (identifying users from browser/device traits without consent) is avoided: it is a privacy problem.
+### Chosen: user id + cookie + IP, checked together
 
-### Chosen: user id + cookie + IP, layered
-
-Every request is checked against **several buckets at once**, and is allowed only if **all** of them have a token.
+A request is allowed only if **every** bucket that applies to it has a token.
 
 | Layer | Applies when | Key | Stops |
 |-------|--------------|-----|-------|
@@ -144,20 +121,16 @@ flowchart TB
     All -- no --> Deny[429]
 ```
 
-Why layered and not one combined key (e.g. user + cookie + IP in one key): a combined key changes whenever any part changes, so clearing a cookie or switching networks would give the caller a fresh, full bucket. Separate layers mean the IP bucket still holds even when the cookie is reset.
+| Question | Answer |
+|----------|--------|
+| Why separate layers, not one combined key? | A combined key changes when any part changes, so clearing a cookie or switching networks would give a fresh, full bucket. With layers, the IP bucket still holds. |
+| What if one layer says no? | All-or-nothing: no bucket loses a token. The Lua script checks every bucket in one Redis call ([details](../src/token_bucket/README.md#the-lua-script)). |
+| Test-only shortcut 1 | The user id comes from an `X-User-Id` header, which a caller can fake. In real use it would come from a verified login token. |
+| Test-only shortcut 2 | The cookie is a random session id the client sends; we don't issue or sign it. |
 
-Test-only shortcuts (fine here, not for real use):
+## Where the rules are stored
 
-- The user id comes from an `X-User-Id` header, which a caller can fake. In real use it would come from a verified login token.
-- The cookie is a random session id the client sends; we don't issue or sign it.
-
-Checking several buckets is all-or-nothing: if the IP bucket denies, the user bucket doesn't lose a token. The Lua script checks every bucket in one Redis call ([details](../src/token_bucket/README.md#the-lua-script)).
-
-### Where the rules are stored
-
-Decided: S3 is the source of truth. Each limiter loads `rules.yaml` at startup and keeps it in memory. Every N seconds it asks S3 for the file only if the ETag changed; an unchanged file returns a tiny "not modified" response. Rule reads on the request path are a memory lookup.
-
-Options considered:
+**Chosen: S3.** Each limiter loads `rules.yaml` at startup and keeps it in memory. Every N seconds it asks S3 for the file only if the ETag changed; an unchanged file returns a tiny "not modified" answer. Reading a rule on a request is a memory lookup.
 
 | Option | Cost | Read speed | Fits when |
 |--------|------|-----------|-----------|
@@ -166,9 +139,16 @@ Options considered:
 | AWS AppConfig | Small per-request fee | Fast, built-in caching | Need validation and staged rollout of rule changes |
 | EFS / EBS (literal disk) | Paid while it exists, EFS needs a VPC | Fast | Not a good fit: more cost and setup for no gain here |
 
+## Algorithms
+
+| Algorithm | In short | Status | Details |
+|-----------|----------|--------|---------|
+| Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. One atomic Lua script in Redis. | Deployed, measured | [src/token_bucket/README.md](../src/token_bucket/README.md) |
+| Leaky bucket (queue) | Requests wait in an SQS FIFO line per tier; a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | Built, not deployed yet | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
+
 ## Code and container layout
 
-One folder per algorithm. Each has a Compose file that starts the router, one limiter per language, and Redis (the leaky bucket also starts one worker per language). The algorithm's Redis part is a Lua script that runs inside Redis, shared by every language.
+One folder per algorithm. Each has a Compose file that starts the router, one limiter per language and Redis (the leaky bucket also starts one worker per language).
 
 ```text
 src/
@@ -194,49 +174,42 @@ src/
     └── node/                ← server.js (limiter), worker.js, common.js, package files, 2 Dockerfiles
 ```
 
-The leaky bucket reuses two token bucket files instead of copying them: `router/nginx.conf` (mounted by its Compose file) and `token_bucket.lua` (copied into its limiter images, for the polling limit). Its Docker build context is `src/` for that reason.
-
-Diagram of every file and what it does: [token bucket](../src/token_bucket/CODE_STRUCTURE.md), [leaky bucket](../src/leaky_bucket/CODE_STRUCTURE.md).
-
-Only source files and Dockerfiles go to GitHub (each Dockerfile is ~10-20 lines). Images are built on the EC2 instance and never committed.
-
-## Algorithms
-
-Each algorithm lives in its own folder under `src/` with its own README (how it works, Redis data model, memory sizing). The rest of this page (placement, routing, identity, rules storage, security) is shared by all algorithms.
-
-| Algorithm | In short | Details |
-|-----------|----------|---------|
-| Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. Runs as one atomic Lua script in Redis. | [src/token_bucket/README.md](../src/token_bucket/README.md) |
-| Leaky bucket (queue) · *built, not deployed yet* | Requests wait in an SQS FIFO line per tier and a worker processes them at a fixed rate (regular 1/s, business 5/s). A user with a full line gets 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | [src/leaky_bucket/README.md](../src/leaky_bucket/README.md) |
+| Good to know | |
+|---|---|
+| Shared files | The leaky bucket reuses `router/nginx.conf` (mounted by its Compose file) and `token_bucket.lua` (for the polling limit) instead of copying them. Its Docker build context is `src/` for that reason. |
+| File maps | [Token bucket](../src/token_bucket/CODE_STRUCTURE.md), [leaky bucket](../src/leaky_bucket/CODE_STRUCTURE.md): every file and what it does. |
+| What goes to GitHub | Only source files and Dockerfiles (each ~10–20 lines). Images are built on the EC2 and never committed. |
 
 ## Latency measurement
 
-| What | Where it is measured |
-|------|----------------------|
-| Rate limiter's own latency (request in → decision out, Redis time) | Timings logged inside each limiter container |
+| What | Where it's measured |
+|------|---------------------|
+| The limiter's own latency (request in → decision out, Redis time) | `Server-Timing` header from each limiter |
 | End-to-end latency from a real client | From your laptop, direct to the EC2 public IP |
 
 Languages are tested one at a time on the same instance so they don't compete for CPU.
 
 ## Security
 
-This project deliberately deviates from the repo default of IAM (SigV4) auth on every API. It is an explicit, short-lived test choice:
+This project **deliberately breaks** the repo default of IAM (SigV4) auth on every API. It's an explicit, short-lived test choice. Don't copy this pattern for anything long-lived.
 
-- The EC2 has a public IP. The security group ships with **no inbound rules**. After deploy, the owner adds their own IP by hand in the console, so no IP is ever stored in this public repo.
-- Only the router port is opened to that IP. No SSH; shell access uses SSM Session Manager.
-- There is no auth check on the endpoint. Anyone behind the allowed IP can reach it while it is up.
-- Plain HTTP over the internet. Test data only.
-- Redis is never published; it is reachable only on the Docker network.
-- The backend Lambda is invoked with the instance role (least privilege: `lambda:InvokeFunction` on that one function).
-- With the leaky bucket, the role may also use the SQS queues of this stage only (send, receive, delete, change visibility, read attributes on `rate-limiter-<stage>-*`).
-- The stack is deleted after each test session.
-
-Do not copy this pattern for anything long-lived.
+| Area | Setting |
+|------|---------|
+| Network | The EC2 has a public IP. The security group ships with **no inbound rules**; after deploy the owner adds their own IP by hand, so no IP is ever stored in this public repo. |
+| Open ports | Only the router port (8080), and only to that IP. No SSH; shell access via SSM Session Manager. |
+| Auth | None on the endpoint. Anyone behind the allowed IP can reach it while it's up. |
+| Transport | Plain HTTP over the internet. Test data only. |
+| Redis | Never published; reachable only on the Docker network. Password required. |
+| Backend | Invoked with the instance role (least privilege: `lambda:InvokeFunction` on that one function). |
+| SQS (leaky bucket) | The role may use only this stage's queues: send, receive, delete, change visibility, read attributes on `rate-limiter-<stage>-*`. |
+| Lifetime | The stack is deleted after each test session. |
 
 ## Build phases
 
-1. **Phase 1 · Single server.** One EC2 with Docker Compose: router, limiter per language, Redis container, Lambda backend.
-2. **Phase 2 · Scale out.** More instances (e.g. ECS), shared Redis (e.g. ElastiCache), load tuning.
+| Phase | What |
+|-------|------|
+| 1 · Single server (now) | One EC2 with Docker Compose: router, limiter per language, Redis container, Lambda backend |
+| 2 · Scale out | More instances (e.g. ECS), shared Redis (e.g. ElastiCache), load tuning |
 
 Parked: fail open vs fail closed.
 
@@ -249,8 +222,8 @@ Parked: fail open vs fail closed.
 | Algorithm | Token bucket (bucket size, refill rate), then leaky bucket as a queue | | Token bucket first; leaky bucket second, same router, Redis and EC2, selected by the `Algorithm` stack parameter |
 | Leaky bucket queue | SQS FIFO, one queue per language and tier | Redis list on the EC2 | Queue lives outside the instance, strict order, built-in retries and dead-letter queue |
 | Who sets the leak rate | The worker (one pacing loop per tier) | Redis delaying the reply | The worker starts one job every `1 / leak_rate` s; Redis only does bookkeeping |
-| Middleware compute (phase 1) | One EC2 + Docker Compose | Lambda | Behaves like the real long-running server; no cold starts or VPC complexity |
-| Lambda middleware | Rejected | Concurrency 1, normal concurrency | Cold starts, no shared memory, throttling at concurrency 1; measures Lambda, not the limiter |
+| Limiter compute (phase 1) | One EC2 + Docker Compose | Lambda | Behaves like the real long-running server; no cold starts or VPC complexity |
+| Lambda as the limiter | Rejected | Concurrency 1, normal concurrency | Cold starts, no shared memory, throttling at concurrency 1; measures Lambda, not the limiter |
 | Counter store | Redis container on the same EC2 | ElastiCache | Cheapest for phase 1; ElastiCache in phase 2 |
 | Redis key | `<rule>-u<caller>`, e.g. `user-u42`; IPv4 stored as a number | `tb:default-per-user:user42` | Shorter key = less memory per user; same lookup speed |
 | Token storage | Whole milli-tokens (1 token = 1000), fields `t` and `ts` | Fractional tokens as text | Compact integer storage, no floating-point drift |
@@ -259,9 +232,11 @@ Parked: fail open vs fail closed.
 | Rules store | S3 YAML, in limiter memory, refreshed by ETag | DynamoDB, AppConfig, EFS/EBS, Redis | Cheapest, versioned, memory-speed reads |
 | Rule loading | Poll S3 with ETag | Loader Lambda push, pull on miss | No extra Lambda; a long-running server can poll cheaply |
 | Container layout | One Compose per algorithm, one Dockerfile per language | One Dockerfile with all languages | Small, separate builds; one process per container |
-| Network access | Public IP, security group allows owner's IP only (added manually) | SSM tunnel | Owner wants direct laptop → AWS latency; tunnel adds a noisy hop |
+| Network access | Public IP, security group allows owner's IP only (added manually) | SSM tunnel | Owner wants direct laptop → AWS latency; the tunnel adds a noisy hop |
 
 ## Limits
 
-- Phase 1 is a single instance: no high availability.
-- No auth on the endpoint (see Security).
+| Limit | Why |
+|-------|-----|
+| No high availability | Phase 1 is a single instance |
+| No auth on the endpoint | See [Security](#security) |

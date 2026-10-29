@@ -2,9 +2,10 @@
 
 [← Architecture](../../docs/architecture.md) · [Project README](../../README.md) · [Token bucket](../token_bucket/README.md) · [Code structure](CODE_STRUCTURE.md)
 
-**Status: built and tested locally, not deployed yet.** Latency results: to be measured after deploy.
-
 The second rate limiting algorithm. Requests wait in a line and are processed at a **fixed speed**. Example used throughout: a **chat agent**, where every message waits its turn for the busy model, and business users get a faster lane.
+
+| Status | Built and tested locally, not deployed yet. Latency: to be measured after deploy |
+|---|---|
 
 ## How it works
 
@@ -15,12 +16,25 @@ flowchart LR
     Q -- "leaks at a fixed rate<br/>1 every 1/leak_rate s" --> OUT["Processed<br/>(smooth, even pace)"]
 ```
 
-- **Empty queue:** the first request is processed right away.
-- **Busy queue:** each new request waits its turn, first in, first out.
-- **Full line (for that user):** new requests get 429 straight away.
-- Token bucket vs leaky bucket: the token bucket **cuts off** extra traffic but lets allowed bursts through at once. The leaky bucket **smooths** traffic: the backend always sees an even pace.
+| Queue state | What happens to a new request |
+|-------------|-------------------------------|
+| Empty | Processed right away |
+| Busy | Waits its turn, first in, first out |
+| Full (for that user) | `429` straight away |
 
-Like a coffee shop: SQS is the **line**, the worker is the **barista** (their speed is the leak rate), and Redis is the **door guard** (counts how many each customer has in line).
+| | Token bucket | Leaky bucket |
+|---|---|---|
+| Extra traffic | Cut off | Waits in line (up to a limit) |
+| Allowed bursts | Go through at once | Spread out |
+| What the backend sees | Bursts | An even pace |
+
+Like a coffee shop:
+
+| Coffee shop | Here | Job |
+|-------------|------|-----|
+| The line | SQS | Holds waiting requests in order |
+| The barista | Worker | Their speed is the leak rate |
+| The door guard | Redis | Counts how many each customer has in line |
 
 ## Tiers
 
@@ -30,18 +44,22 @@ Like a coffee shop: SQS is the **line**, the worker is the **barista** (their sp
 | 1 | business | 5 per second | 10 |
 | 2–255 | future | set in `rules.yaml` | set in `rules.yaml` |
 
-- A user's tier is a small number in one Redis hash (`tiers`: user id → tier). Users not in it, or with a tier that is not configured, are tier 0.
-- Each tier has **its own queue**, so business never waits behind regular.
-- Test setup only: `seed_tiers` in `rules.yaml` writes users `biz1` to `biz5` into tier 1 when a limiter starts. In real use the tier would come from the user's verified account, never from a file.
+| Question | Answer |
+|----------|--------|
+| Where is a user's tier stored? | A small number in one Redis hash (`tiers`: user id → tier). Users not in it, or with a tier that isn't configured, are tier 0 |
+| Does business wait behind regular? | No: each tier has **its own queue** |
+| Test users | `seed_tiers` in `rules.yaml` writes users `biz1` to `biz5` into tier 1 when a limiter starts. Test setup only: in real use the tier would come from the user's verified account, never from a file |
 
 ### How to add a tier
 
-1. Add an entry under `tiers` in [`rules.yaml`](rules.yaml): `id`, `name`, `leak_rate`, `max_waiting`.
-2. Add the tier number to the tier list of the queue loop in [`infrastructure/template.yaml`](../../infrastructure/template.yaml) (and to the matching list in `Outputs`). That creates one queue plus one dead-letter queue per language.
-3. Deploy. Limiters pick up `rules.yaml` by ETag within ~30 s. **Workers read the rules once at start**, so restart them (a code change replaces the instance, which does the same).
-4. Put users in the new tier by writing `HSET tiers <user> <tier>` (or add test users to `seed_tiers`).
+| Step | Do | Where |
+|------|----|-------|
+| 1 | Add an entry under `tiers`: `id`, `name`, `leak_rate`, `max_waiting` | [`rules.yaml`](rules.yaml) |
+| 2 | Add the tier number to the tier list of the queue loop (and the matching list in `Outputs`). This creates one queue + one dead-letter queue per language | [`infrastructure/template.yaml`](../../infrastructure/template.yaml) |
+| 3 | Deploy. Limiters pick up `rules.yaml` within ~30 s. **Workers read the rules once at start**, so restart them (a code change replaces the instance, which does the same) | `deploy.sh` |
+| 4 | Put users in the new tier: `HSET tiers <user> <tier>` (or add test users to `seed_tiers`) | Redis |
 
-No code change is needed: the Lua scripts, limiters and workers loop over whatever tiers `rules.yaml` lists.
+No code change needed: the Lua scripts, limiters and workers loop over whatever tiers `rules.yaml` lists.
 
 ## API
 
@@ -53,11 +71,23 @@ Same prefixes as the token bucket: nginx sends `/python/…`, `/go/…`, `/node/
 | `GET /<lang>/result/<job_id>` | same `X-User-Id` as the POST (else 404) | none | `200 {status, tier, position, …}`; `429` + `Retry-After` when polling too fast |
 | `GET /<lang>/healthz` | none | none | `200 {"ok":true}`, no checks |
 
-Result fields: `status` is `queued`, `processing`, `done`, `failed` or `expired`. While waiting, `position` is the place in line (1 = next up); once ended it is 0 and the answer carries `queue_wait_ms`, `processing_ms` and `answer` (done) or `error` (failed or expired).
+| Job status | Meaning | Extra fields |
+|------------|---------|--------------|
+| `queued` | Waiting in line | `position` (1 = next up) |
+| `processing` | The worker has started it | |
+| `done` | Finished | `answer`, `queue_wait_ms`, `processing_ms` |
+| `failed` | 5 attempts failed | `error`, `queue_wait_ms`, `processing_ms` |
+| `expired` | Waited more than 2 minutes | `error` |
 
-Other answers: `400` bad or missing `X-User-Id` / bad body, `404` unknown path or job (also someone else's job), `405` wrong method, `413` body over 4 KB, `502` the job could not be queued (the user's place is given back).
+| Other answers | When |
+|---------------|------|
+| `400` | Bad or missing `X-User-Id`, or a bad body |
+| `404` | Unknown path or job (also someone else's job) |
+| `405` | Wrong method |
+| `413` | Body over 4 KB |
+| `502` | The job couldn't be queued (the user's place is given back) |
 
-Test-only hook: a POST body `{"message": "…", "fail": true}` makes the backend raise an error for that job, so retries and the failed state can be tested. It travels in the SQS message body to the worker, which passes it to the backend Lambda. Remove it before any real use.
+**Test-only hook:** a POST body `{"message": "…", "fail": true}` makes the backend raise an error for that job, so retries and the `failed` state can be tested. It travels in the SQS message to the worker, which passes it to the backend Lambda. Remove it before any real use.
 
 ## The flow
 
@@ -100,10 +130,14 @@ sequenceDiagram
 | Redis | Tier lookup, per-user line count, ticket counters, results | No |
 | Backend Lambda | Fake chat agent: sleeps 200 ms (`sleep_ms`), replies | No |
 
-- **FIFO queue:** a standard SQS queue doesn't guarantee order; a leaky bucket must be first in, first out. All jobs of a queue share one message group, so the order is strict.
-- **Worker starts on every tick and doesn't wait for the reply,** so a 200 ms agent can keep up with business's 5/s (one start every 200 ms). If the worker was idle, missed ticks are not made up: there is no burst after a quiet period.
-- **One set of queues per language** (3 languages × 2 tiers = 6 queues): `/python` uses Python's queues and worker, etc., so each language is measured on its own, like the token bucket.
-- **Queue names:** `rate-limiter-<stage>-<lang>-t<tier>.fifo`, dead-letter queue `rate-limiter-<stage>-<lang>-t<tier>-dlq.fifo`. Encrypted at rest (SQS-managed keys).
+| Detail | Why |
+|--------|-----|
+| **FIFO queue**, one message group per queue | A standard SQS queue doesn't guarantee order; a leaky bucket must be strictly first in, first out |
+| **The worker starts on every tick**, without waiting for the reply | A 200 ms agent can keep up with business's 5/s (one start every 200 ms) |
+| No catch-up after idle time | Missed ticks aren't made up, so there's no burst after a quiet period |
+| **One set of queues per language** (3 × 2 tiers = 6) | `/python` uses Python's queues and worker, etc., so each language is measured on its own |
+| Queue names | `rate-limiter-<stage>-<lang>-t<tier>.fifo`, dead-letter `rate-limiter-<stage>-<lang>-t<tier>-dlq.fifo` |
+| Encryption | At rest, SQS-managed keys |
 
 ## Retention, retries and failure
 
@@ -132,10 +166,12 @@ All of these (except the queue properties in CloudFormation) are in [`rules.yaml
 
 Two atomic Lua scripts do all the bookkeeping:
 
-- [`accept.lua`](accept.lua): reads the tier, compares the user's line count with the tier's `max_waiting`, and either refuses (nothing written) or adds one to the line count, takes a ticket and creates the job. Returns accepted, tier, ticket, position and `retry_after_ms`.
-- [`finish.lua`](finish.lua): moves a job to `processing`, `done`, `failed` or `expired`. Ending a job saves the answer or error, takes one off the line count (never below 0) and moves "now serving" on. Calling it twice for the same job changes nothing the second time, because SQS can deliver a message again.
+| Script | Does | Returns |
+|--------|------|---------|
+| [`accept.lua`](accept.lua) | Reads the tier, compares the user's line count with the tier's `max_waiting`. Full → refuses, writes nothing. Room → line count +1, takes a ticket, creates the job | accepted, tier, ticket, position, `retry_after_ms` |
+| [`finish.lua`](finish.lua) | Moves a job to `processing`, `done`, `failed` or `expired`. Ending a job saves the answer or error, line count −1 (never below 0), "now serving" +1. Safe to call twice (SQS can deliver a message again) | changed or not |
 
-Both build some key names from their arguments. That is fine on the single Redis node used here; Redis Cluster would need hash tags (phase 2).
+Both build some key names from their arguments. Fine on the single Redis node used here; Redis Cluster would need hash tags (phase 2).
 
 ## Polling limit
 
@@ -163,18 +199,21 @@ Job ids are random UUIDs, and a poll must come from the user who sent the job, s
 
 ## Deploy, test, teardown
 
-```bash
-cd projects/03-rate-limiter
-./scripts/deploy.sh dev us-east-1 leaky_bucket     # creates the 12 SQS queues, uploads code + rules, waits until healthy
-# Console: add ONE inbound rule to the SecurityGroupId output: TCP 8080, <your-ip>/32
-python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3    # 3 rounds per language
-./scripts/destroy.sh dev us-east-1                 # deletes the stack, queues and this stage's artifacts
-```
+Run from `projects/03-rate-limiter`:
 
-- The template uses `Fn::ForEach` (the `AWS::LanguageExtensions` transform), so deploying needs `CAPABILITY_AUTO_EXPAND`; `deploy.sh` passes it.
-- Switching a stack between `token_bucket` and `leaky_bucket` changes the boot script, so the instance is replaced (new public IP; your security group rule stays).
-- SQS refuses to create a queue with a name used in the last ~60 seconds, so wait a minute before deploying again after a delete.
-- Moving `rules.yaml` only: re-run `deploy.sh`; limiters pick it up in ~30 s, workers need a restart.
+| Step | Command |
+|------|---------|
+| Deploy (creates the 12 SQS queues, uploads code + rules, waits until healthy) | `./scripts/deploy.sh dev us-east-1 leaky_bucket` |
+| Allow your IP | Console: add ONE inbound rule to the `SecurityGroupId` output: TCP 8080, `<your-ip>/32` |
+| Test (3 rounds per language) | `python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3` |
+| Tear down (stack, queues, this stage's artifacts) | `./scripts/destroy.sh dev us-east-1` |
+
+| Good to know | |
+|--------------|---|
+| `CAPABILITY_AUTO_EXPAND` | Needed because the template uses `Fn::ForEach` (the `AWS::LanguageExtensions` transform); `deploy.sh` passes it |
+| Switching algorithm | Changes the boot script, so the instance is replaced (new public IP; your security group rule stays) |
+| Redeploying after a delete | SQS refuses a queue name used in the last ~60 s, so wait a minute |
+| Changing only `rules.yaml` | Re-run `deploy.sh`; limiters pick it up in ~30 s, workers need a restart |
 
 ## What the test checks
 
@@ -204,11 +243,20 @@ To be measured after deploy.
 
 ## Checked so far, and what is not
 
-Checked locally (Python, Node and Go limiter + worker against a Redis stand-in with real Lua and an SQS FIFO stand-in): both Lua scripts, the API errors, regular and business bursts, the fixed pace, the poll limit, the fail hook (`failed` after 5 attempts), `expired`, and that line counts return to 0. `cfn-lint` passes for the template.
-
-Not checked yet: real SQS FIFO behaviour, the real Lambda call from the Go and Node workers, Docker image builds, S3 rules loading, and the stack behind nginx. These get exercised by the first deploy.
+| Checked locally ✅ | Not checked yet ⬜ (the first deploy covers these) |
+|--------------------|---------------------------------------------------|
+| Both Lua scripts | Real SQS FIFO behaviour |
+| Python, Node and Go limiter + worker (Redis stand-in with real Lua, SQS FIFO stand-in) | The real Lambda call from the Go and Node workers |
+| API errors, regular and business bursts, the fixed pace | Docker image builds |
+| Poll limit, fail hook (`failed` after 5 attempts), `expired` | S3 rules loading |
+| Line counts return to 0; `cfn-lint` passes | The stack behind nginx |
 
 ## What changed in the project
 
-- **New:** this folder (Lua scripts, 3 limiters, 3 workers, Compose file), 6 SQS FIFO queues + 6 dead-letter queues in CloudFormation (only when `Algorithm=leaky_bucket`), instance role allowed to use only those queues, backend can sleep and fail on request, `leaky_latency.py`.
-- **Unchanged:** nginx routing, Redis, EC2 size, destroy flow, IP-only access.
+| New | Unchanged |
+|-----|-----------|
+| This folder (Lua scripts, 3 limiters, 3 workers, Compose file) | nginx routing |
+| 6 SQS FIFO queues + 6 dead-letter queues (only when `Algorithm=leaky_bucket`) | Redis |
+| Instance role may use only those queues | EC2 size |
+| Backend can sleep and fail on request | Destroy flow |
+| `leaky_latency.py` | IP-only access |
