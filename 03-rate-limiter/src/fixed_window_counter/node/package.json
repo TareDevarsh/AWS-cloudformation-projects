@@ -1,0 +1,19 @@
+{
+  "name": "limiter-node",
+  "version": "1.0.0",
+  "description": "Fixed window counter rate limiter server, Node version",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "3.1158.0",
+    "@aws-sdk/client-s3": "3.1158.0",
+    "ioredis": "5.11.1",
+    "js-yaml": "4.3.2"
+  }
+}

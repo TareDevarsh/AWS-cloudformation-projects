@@ -5,14 +5,15 @@ Transform: AWS::LanguageExtensions
 # Shown in the CloudFormation console for this stack.
 Description: >-
   03-rate-limiter: one EC2 running nginx + rate limiters (Python, Go, Node;
-  token bucket or leaky bucket) + Redis in Docker Compose, in front of a Lambda
+  token bucket, leaky bucket, sliding window log or fixed window counter) +
+  Redis in Docker Compose, in front of a Lambda
   backend. The leaky bucket also gets SQS FIFO queues. Short-lived test stack:
   delete after each session.
 
 # How this stack is used:
 #   1. scripts/deploy.sh uploads the code zip and the chosen algorithm's
 #      rules.yaml to the private artifact bucket, then deploys this template
-#      with their S3 keys and the Algorithm (token_bucket or leaky_bucket).
+#      with their S3 keys and the Algorithm (one of the four AllowedValues below).
 #   2. The EC2 boots, installs Docker, downloads the code, starts Compose, and
 #      signals CloudFormation once all three limiters answer /healthz.
 #   3. The security group starts with NO inbound rules. The owner adds their
@@ -24,7 +25,7 @@ Parameters:
   Algorithm:
     Type: String # folder name under src/ in the code zip
     Default: token_bucket # the original stack, no queues...
-    AllowedValues: [token_bucket, leaky_bucket] # ...or the queue-based one (also creates the SQS queues below)
+    AllowedValues: [token_bucket, leaky_bucket, sliding_window_log, fixed_window_counter] # leaky_bucket also creates the SQS queues below; the two window algorithms need nothing extra
     Description: Algorithm to run. leaky_bucket also creates the SQS FIFO queues (one per language and tier).
 
   # Environment name, used in resource names and tags.
@@ -64,7 +65,7 @@ Parameters:
 
 # Switches that turn parts of the stack on or off.
 Conditions:
-  # True only for the leaky bucket: the SQS queues and their permissions exist only then.
+  # True only for the leaky bucket (false for the other three): the SQS queues and their permissions exist only then.
   IsLeaky: !Equals [!Ref Algorithm, leaky_bucket]
 
 # Everything this stack creates.
@@ -291,7 +292,7 @@ Resources:
                     - sqs:ChangeMessageVisibility # worker: bring a failed job back sooner
                     - sqs:GetQueueAttributes # SDKs read queue attributes
                   Resource: !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:rate-limiter-${Stage}-*" # ...only on this stage's queues, nothing else
-                - !Ref AWS::NoValue # token bucket: no statement at all
+                - !Ref AWS::NoValue # other algorithms: no statement at all
       Tags:
         - { Key: Project, Value: "03-rate-limiter" } # repo tag convention
         - { Key: Stage, Value: !Ref Stage } # repo tag convention
@@ -389,7 +390,7 @@ Resources:
           aws s3 cp "s3://${ArtifactBucket}/${AppKey}" /tmp/app.zip --region ${AWS::Region}
           # Unpack it.
           unzip -o /tmp/app.zip -d "$APP"
-          # Compose runs from the algorithm folder (token_bucket or leaky_bucket).
+          # Compose runs from the chosen algorithm's folder (e.g. token_bucket or sliding_window_log).
           cd "$APP/${Algorithm}"
 
           # New files readable by root only (protects .env).
@@ -405,7 +406,7 @@ Resources:
           EOF
 
           # Build all images and start the stack in the background (Go deps are fetched here).
-          # SQS_PREFIX in .env is used only by the leaky bucket; the token bucket ignores it.
+          # SQS_PREFIX in .env is used only by the leaky bucket; the other algorithms ignore it.
           docker compose up -d --build
 
           # For each language...

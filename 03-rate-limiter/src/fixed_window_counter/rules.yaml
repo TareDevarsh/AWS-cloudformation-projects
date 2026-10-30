@@ -1,0 +1,40 @@
+# Rate limit rules for the fixed window counter limiter.
+# Uploaded to S3 on deploy; every limiter keeps a copy in memory and
+# re-reads it only when the S3 ETag changes.
+#
+# id          short name, lowercase letters/digits only. Used in the Redis key:
+#             "<id>-u<caller>-w<window number>", e.g. user-u42-w1761580000
+# match.key   who the counter is for:
+#               user_id  X-User-Id header (test only: callers can fake it)
+#               cookie   "session" cookie, used only when there is no user id
+#               ip       client IP as seen by nginx (always checked)
+# match.path  "*" = every path, "/x" = exactly /x, "/x/*" = /x and below.
+#             Path is after the language prefix (/python/login -> /login).
+# limit       requests allowed per window (whole number)
+# window_s    window length in seconds
+
+# List of rules; a request is checked against every rule that matches it.
+rules:
+  # Per logged-in user, on every path.
+  - id: user # Redis key: user-u<user id>-w<window>
+    match: { key: user_id, path: "*" } # applies when X-User-Id is present
+    limit: 10 # 10 requests...
+    window_s: 1 # ...per 1 s window
+
+  # Per logged-out visitor (session cookie), on every path.
+  - id: cookie # Redis key: cookie-u<session id>-w<window>
+    match: { key: cookie, path: "*" } # applies only when there's no user id
+    limit: 5 # 5 requests...
+    window_s: 1 # ...per 1 s window
+
+  # Per client IP, on every path. Always checked.
+  - id: ip # Redis key: ip-u<IPv4 as a number>-w<window>
+    match: { key: ip, path: "*" } # every request has an IP
+    limit: 20 # looser: many users can share one IP
+    window_s: 1 # per 1 s window
+
+  # Extra limit on the login page, per IP.
+  - id: login # Redis key: login-u<IPv4 as a number>-w<window>
+    match: { key: ip, path: /login } # only /login
+    limit: 5 # 5 attempts...
+    window_s: 60 # ...per 60 s window

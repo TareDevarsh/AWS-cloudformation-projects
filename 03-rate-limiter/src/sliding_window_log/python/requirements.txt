@@ -1,0 +1,8 @@
+# ASGI server that runs app.py
+uvicorn==0.54.0
+# Redis client (async), runs sliding_window_log.lua via EVALSHA
+redis==8.1.0
+# AWS SDK: reads rules from S3, invokes the backend Lambda
+boto3==1.43.120
+# Parses rules.yaml
+PyYAML==6.0.3

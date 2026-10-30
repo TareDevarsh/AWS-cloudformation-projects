@@ -14,7 +14,7 @@ Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) 
 |---|---------|---------------|--------------|--------|
 | 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
-| 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket (Redis) and leaky bucket (SQS queue), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
+| 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket, leaky bucket (SQS queue), sliding window log and fixed window counter (Redis), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -47,7 +47,7 @@ Every entry below is a link, so you can jump straight to the file.
   - 📦 **[03 · Rate Limiter](03-rate-limiter/)**
     - [Architecture](03-rate-limiter/docs/architecture.md) · [Workflows](03-rate-limiter/docs/workflow.md)
     - [Template](03-rate-limiter/infrastructure/template.yaml) · [Code](03-rate-limiter/src/) · [Scripts](03-rate-limiter/scripts/)
-    - Algorithms: [Token bucket](03-rate-limiter/docs/token_bucket/README.md) · [Leaky bucket](03-rate-limiter/docs/leaky_bucket/README.md)
+    - Algorithms: [Token bucket](03-rate-limiter/docs/token_bucket/README.md) · [Leaky bucket](03-rate-limiter/docs/leaky_bucket/README.md) · [Sliding window log](03-rate-limiter/docs/sliding_window_log/README.md) · [Fixed window counter](03-rate-limiter/docs/fixed_window_counter/README.md)
     - [Live tests](03-rate-limiter/tests/integration/)
 
 ```mermaid
@@ -59,6 +59,8 @@ mindmap
       Middleware on EC2 + Redis
       Token bucket
       Leaky bucket · SQS
+      Sliding window log
+      Fixed window counter
 ```
 
 ## How each project is built
@@ -96,10 +98,10 @@ aws-projects/
 │   └── scripts/                 ← deploy.sh, train.sh, destroy.sh
 ├── 03-rate-limiter/
 │   ├── README.md                ← summary, latency log
-│   ├── docs/                    ← architecture.md, workflow.md, token_bucket/, leaky_bucket/
+│   ├── docs/                    ← architecture.md, workflow.md, one folder per algorithm
 │   ├── infrastructure/          ← template.yaml (Algorithm parameter)
-│   ├── src/                     ← token_bucket/, leaky_bucket/, backend/
-│   ├── tests/integration/       ← latency.py, leaky_latency.py
+│   ├── src/                     ← token_bucket/, leaky_bucket/, sliding_window_log/, fixed_window_counter/, backend/
+│   ├── tests/integration/       ← latency.py, leaky_latency.py, window_latency.py
 │   └── scripts/                 ← deploy.sh, destroy.sh
 ├── docs/
 │   └── CONVENTIONS.md           ← folder rules, README order, diagram + security standards
@@ -129,8 +131,12 @@ graph TD
     P3 --> A3[architecture.md] & W3[workflow.md]
     A3 --> TB[token_bucket/README.md]
     A3 --> LB[leaky_bucket/README.md]
+    A3 --> SW[sliding_window_log/README.md]
+    A3 --> FW[fixed_window_counter/README.md]
     TB --> TBC[CODE_STRUCTURE.md]
     LB --> LBC[CODE_STRUCTURE.md]
+    SW --> SWC[CODE_STRUCTURE.md]
+    FW --> FWC[CODE_STRUCTURE.md]
     A3 --> I3[infrastructure/template.yaml]
     W3 --> S3[scripts + tests]
 ```

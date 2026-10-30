@@ -21,10 +21,12 @@ stateDiagram-v2
 
 ## What `deploy.sh` does
 
+The third argument picks the algorithm: `token_bucket` (default), `leaky_bucket`, `sliding_window_log` or `fixed_window_counter`.
+
 ```mermaid
 flowchart LR
     L[1 · cfn-lint] --> B[2 · artifact bucket<br/>private, encrypted]
-    B --> Z[3 · zip src/token_bucket<br/>+ src/leaky_bucket]
+    B --> Z[3 · zip all 4 algorithm<br/>folders in src/]
     Z --> U[4 · upload zip + rules.yaml]
     U --> P[5 · package backend Lambda]
     P --> D[6 · deploy stack<br/>waits for the EC2 signal]
@@ -34,7 +36,7 @@ flowchart LR
 |------|--------------|-----|
 | 1. Lint | `cfn-lint` checks the template | Catch mistakes before AWS sees them |
 | 2. Artifact bucket | `cfn-artifacts-<account>-<region>`, created once: private, encrypted | The handover point between your laptop and AWS |
-| 3. Zip the code | Both algorithm folders; skips `node_modules`, `__pycache__`, `.venv`, `.env`. The S3 key includes a hash of the contents | New code = new key = CloudFormation replaces the instance. Same code = nothing to do |
+| 3. Zip the code | All four algorithm folders; skips `node_modules`, `__pycache__`, `.venv`, `.env`. The S3 key includes a hash of the contents | New code = new key = CloudFormation replaces the instance. Same code = nothing to do |
 | 4. Upload | Code zip + the chosen algorithm's `rules.yaml` | The EC2 downloads them with its own role |
 | 5. Package | `cloudformation package` uploads `src/backend/` and points the template at it | CloudFormation can't read your laptop |
 | 6. Deploy | Creates or updates the stack with `Algorithm`, `AppKey`, `RulesKey`; waits until the EC2 says it's healthy | One command for the whole stack |
@@ -93,6 +95,10 @@ sequenceDiagram
     end
 ```
 
+## One request: sliding window log / fixed window counter
+
+Same flow as the token bucket above. Only the script changes: `sliding_window_log.lua` (one log of request times per key) or `fixed_window_counter.lua` (one counter per key per window). Details: [sliding window log](sliding_window_log/README.md#how-it-works), [fixed window counter](fixed_window_counter/README.md#how-it-works).
+
 ## One request: leaky bucket
 
 Full flow with polling, tiers and retries: [leaky bucket README](leaky_bucket/README.md#the-flow).
@@ -106,14 +112,15 @@ Full flow with polling, tiers and retries: [leaky bucket README](leaky_bucket/RE
 
 ## Test checks
 
-| Check | Token bucket (`latency.py`) | Leaky bucket (`leaky_latency.py`) |
-|-------|-----------------------------|-----------------------------------|
-| Router reachable | `/healthz` → 200 | `/healthz` → 200 |
-| Limit works | 12 parallel requests as one user → 10 × 200, 2 × 429 by `user` | Regular burst of 5 → 3 × 202, 2 × 429; business burst of 5 → all done within ~1.5 s |
-| Polling limit | n/a | Rapid polls on one job → some 429 |
-| Failure path | n/a | Job with `fail` → `failed` after 5 attempts |
-| Latency | p50/p90/p99 of client, total, Redis, backend | p50/p90 of accept, queue wait, processing, end to end |
-| Without your IP | Request times out (no inbound rule) | Same |
+| Check | Token bucket (`latency.py`) | Leaky bucket (`leaky_latency.py`) | Window algorithms (`window_latency.py`) |
+|-------|-----------------------------|-----------------------------------|------|
+| Router reachable | `/healthz` → 200 | `/healthz` → 200 | `/healthz` → 200 |
+| Limit works | 12 parallel requests as one user → 10 × 200, 2 × 429 by `user` | Regular burst of 5 → 3 × 202, 2 × 429; business burst of 5 → all done within ~1.5 s | 12 parallel just after a window starts → 10 × 200, 2 × 429 by `user` |
+| Boundary | n/a | n/a | 10 just before + 10 just after a boundary → fixed window 20, sliding log 10 |
+| Polling limit | n/a | Rapid polls on one job → some 429 | n/a |
+| Failure path | n/a | Job with `fail` → `failed` after 5 attempts | n/a |
+| Latency | p50/p90/p99 of client, total, Redis, backend | p50/p90 of accept, queue wait, processing, end to end | p50/p90/p99 of client, total, Redis, backend |
+| Without your IP | Request times out (no inbound rule) | Same | Same |
 
 ## Teardown
 

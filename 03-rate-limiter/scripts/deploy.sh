@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Lint, upload code + rules, and deploy the rate limiter stack.
 # Usage: ./scripts/deploy.sh [stage] [region] [algorithm]
-#   algorithm: token_bucket (default) or leaky_bucket (also creates the SQS queues)
+#   algorithm: token_bucket (default), leaky_bucket (also creates the SQS queues),
+#              sliding_window_log or fixed_window_counter
 #   e.g.  ./scripts/deploy.sh dev us-east-1 leaky_bucket
 #
 # Re-running is safe:
@@ -17,10 +18,10 @@ REGION="${2:-${AWS_REGION:-us-east-1}}"
 ALGORITHM="${3:-token_bucket}"
 # Stop early on a typo, before anything is uploaded.
 case "$ALGORITHM" in
-  # The two algorithms that exist: nothing to do.
-  token_bucket|leaky_bucket) ;;
+  # The four algorithms that exist: nothing to do.
+  token_bucket|leaky_bucket|sliding_window_log|fixed_window_counter) ;;
   # Anything else: explain and quit.
-  *) echo "Unknown algorithm '${ALGORITHM}' (use token_bucket or leaky_bucket)"; exit 1 ;;
+  *) echo "Unknown algorithm '${ALGORITHM}' (use token_bucket, leaky_bucket, sliding_window_log or fixed_window_counter)"; exit 1 ;;
 esac
 PROJECT="03-rate-limiter"
 STACK="rate-limiter-${STAGE}"
@@ -59,17 +60,17 @@ if ! aws s3api head-bucket --bucket "$BUCKET" --expected-bucket-owner "$ACCOUNT"
     '{"Rules":[{"ID":"expire-old-artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
 fi
 
-# 3. Zip the limiter code. Both algorithm folders go in the same zip (the leaky
-#    bucket reuses token_bucket/token_bucket.lua and token_bucket/router/nginx.conf,
-#    so the two folders must stay side by side); the instance then runs the one
+# 3. Zip the limiter code. All four algorithm folders go in the same zip (the
+#    others reuse token_bucket/router/nginx.conf, and the leaky bucket also
+#    token_bucket/token_bucket.lua, so the folders must stay side by side); the instance then runs the one
 #    chosen by the Algorithm parameter. The S3 key includes a hash of the file
 #    contents, so the instance is replaced only when the code actually changes.
 mkdir -p "$BUILD"
 rm -f "${BUILD}/app.zip"
 (
   cd "$SRC"
-  # Everything under token_bucket/ and leaky_bucket/, minus local junk and secrets.
-  find token_bucket leaky_bucket -type f \
+  # Everything under the four algorithm folders, minus local junk and secrets.
+  find token_bucket leaky_bucket sliding_window_log fixed_window_counter -type f \
     ! -path '*/node_modules/*' ! -path '*/__pycache__/*' ! -path '*/.venv/*' \
     ! -name '.env' ! -name '.DS_Store' | LC_ALL=C sort > "${BUILD}/files.txt"
   HASH="$(xargs shasum -a 256 < "${BUILD}/files.txt" | shasum -a 256 | cut -c1-12)"
@@ -118,4 +119,5 @@ Next: open the SecurityGroupConsole link above and add ONE inbound rule:
 (Your current public IP is shown here only; it is not saved anywhere.)
 Then test:  python3 tests/integration/latency.py <Endpoint>        (token_bucket)
             python3 tests/integration/leaky_latency.py <Endpoint>  (leaky_bucket)
+            python3 tests/integration/window_latency.py <Endpoint> ${ALGORITHM}  (window algorithms)
 EOF

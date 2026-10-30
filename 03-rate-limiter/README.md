@@ -17,10 +17,10 @@ The project is built in small steps. Each step is designed and agreed before it'
 
 | Fact | Value |
 |------|-------|
-| Status | 🟡 Prototype: token bucket deployed and measured; leaky bucket built, not deployed yet |
+| Status | 🟡 Prototype: token bucket deployed and measured; leaky bucket, sliding window log and fixed window counter built, not deployed yet |
 | Where it runs | One EC2 (t3.small) + Docker Compose: nginx router, one limiter per language, Redis |
 | Languages | Python, Go, Node (same algorithm, compared side by side) |
-| Algorithms | [Token bucket](docs/token_bucket/README.md) · [Leaky bucket (SQS queue)](docs/leaky_bucket/README.md) |
+| Algorithms | [Token bucket](docs/token_bucket/README.md) · [Leaky bucket (SQS queue)](docs/leaky_bucket/README.md) · [Sliding window log](docs/sliding_window_log/README.md) · [Fixed window counter](docs/fixed_window_counter/README.md) ([comparison](docs/architecture.md#algorithm-comparison)) |
 | Who is limited | User id + cookie + IP, checked together ([details](docs/architecture.md#identifying-the-caller)) |
 | Rules | `rules.yaml` in S3, kept in limiter memory, re-read when it changes |
 | Backend | AWS Lambda (stand-in for a real server) |
@@ -88,6 +88,8 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 | [docs/workflow.md](docs/workflow.md) | Deploy → boot → test → destroy, step by step |
 | [Token bucket README](docs/token_bucket/README.md) | Algorithm 1, its Redis data and memory sizing |
 | [Leaky bucket README](docs/leaky_bucket/README.md) | Algorithm 2, the queue, API and retries |
+| [Sliding window log README](docs/sliding_window_log/README.md) | Algorithm 3, exact window, its Redis data and memory sizing |
+| [Fixed window counter README](docs/fixed_window_counter/README.md) | Algorithm 4, cheap counter, the boundary weakness, memory sizing |
 
 ## Repo layout
 
@@ -99,6 +101,8 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 │   ├── workflow.md           ← deploy lifecycle and request flow
 │   ├── token_bucket/         ← README.md (how it works, Redis data) + CODE_STRUCTURE.md (Merkle-tree file map)
 │   ├── leaky_bucket/         ← README.md (queue, API, retries) + CODE_STRUCTURE.md (Merkle-tree file map)
+│   ├── sliding_window_log/   ← README.md + CODE_STRUCTURE.md
+│   ├── fixed_window_counter/ ← README.md + CODE_STRUCTURE.md
 │   ├── diagram.py            ← diagram-as-code (AWS icons)
 │   └── images/architecture.png
 ├── infrastructure/
@@ -114,11 +118,14 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 │   │   ├── rules.yaml        ← tiers, queue settings, poll limits
 │   │   ├── docker-compose.yml
 │   │   └── python/ go/ node/ ← one limiter server and one worker per language
+│   ├── sliding_window_log/   ← sliding_window_log.lua, rules.yaml, docker-compose.yml, python/ go/ node/
+│   ├── fixed_window_counter/ ← fixed_window_counter.lua, rules.yaml, docker-compose.yml, python/ go/ node/
 │   └── backend/handler.py    ← backend Lambda (token bucket call, plus chat mode for the leaky bucket)
 ├── tests/
 │   └── integration/
 │       ├── latency.py        ← token bucket live test
 │       ├── leaky_latency.py  ← leaky bucket live test (bursts, polling, failure, p50/p90)
+│       ├── window_latency.py ← window algorithms live test (limit, boundary, p50/p90/p99)
 │       └── sigv4.py          ← helper
 └── scripts/
     ├── deploy.sh             ← lint, package src/, deploy, print outputs
@@ -129,12 +136,17 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 
 The third `deploy.sh` argument picks the algorithm (default `token_bucket`). Step-by-step manual version: [docs/workflow.md](docs/workflow.md).
 
-| Step | Token bucket | Leaky bucket |
-|------|--------------|--------------|
-| 1. Deploy (~5–15 min) | `./scripts/deploy.sh dev us-east-1` | `./scripts/deploy.sh dev us-east-1 leaky_bucket` |
-| 2. Allow your IP | Console: add ONE inbound rule to the `SecurityGroupId` output: TCP 8080, `<your-ip>/32` | same |
-| 3. Test | `python3 tests/integration/latency.py http://<PublicIp>:8080 100` | `python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3` (3 rounds per language) |
-| 4. Tear down | `./scripts/destroy.sh dev us-east-1` | same |
+| Algorithm | 1. Deploy (~5–15 min) | 3. Test |
+|-----------|-----------------------|---------|
+| Token bucket | `./scripts/deploy.sh dev us-east-1` | `python3 tests/integration/latency.py http://<PublicIp>:8080 100` |
+| Leaky bucket | `./scripts/deploy.sh dev us-east-1 leaky_bucket` | `python3 tests/integration/leaky_latency.py http://<PublicIp>:8080 3` (3 rounds per language) |
+| Sliding window log | `./scripts/deploy.sh dev us-east-1 sliding_window_log` | `python3 tests/integration/window_latency.py http://<PublicIp>:8080 sliding_window_log 100` |
+| Fixed window counter | `./scripts/deploy.sh dev us-east-1 fixed_window_counter` | `python3 tests/integration/window_latency.py http://<PublicIp>:8080 fixed_window_counter 100` |
+
+| Step (all algorithms) | What to do |
+|------|------------|
+| 2. Allow your IP | Console: add ONE inbound rule to the `SecurityGroupId` output: TCP 8080, `<your-ip>/32` |
+| 4. Tear down | `./scripts/destroy.sh dev us-east-1` |
 
 Run from `03-rate-limiter`.
 
@@ -168,8 +180,10 @@ Run from `03-rate-limiter`.
 | ✅ Leaky bucket code | `accept.lua`, `finish.lua`, limiter + worker in 3 languages, Compose, `Algorithm` parameter, queues + dead-letter queues, `deploy.sh` third argument |
 | ✅ Leaky bucket test script | `tests/integration/leaky_latency.py` (checked against a local stand-in only) |
 | ✅ Architecture image | `docs/diagram.py` → `docs/images/architecture.png`, both algorithms |
+| ✅ Sliding window log + fixed window counter | Lua scripts, limiters in 3 languages, Compose, `Algorithm` values, `deploy.sh` names, `window_latency.py` (checked against a local stand-in only) ([comparison](docs/architecture.md#algorithm-comparison)) |
 
 | Next | |
 |------|---|
 | ⬜ Leaky bucket live run | Deploy with `leaky_bucket`, run the live test, record its latency |
+| ⬜ Window algorithms live run | Deploy with `sliding_window_log` and `fixed_window_counter`, run `window_latency.py`, record latency and the boundary result |
 | ⬜ Phase 2 | Scale out (more instances, ElastiCache), more algorithms |

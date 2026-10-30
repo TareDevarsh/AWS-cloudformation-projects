@@ -2,7 +2,7 @@
 
 [← Project README](../README.md) · [Architecture image](images/architecture.png) · [Workflows](workflow.md)
 
-This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](token_bucket/README.md), [leaky bucket](leaky_bucket/README.md)).
+This page covers what every algorithm shares: where the limiter sits, the setup, who gets limited, where rules live, security and decisions. Each algorithm's own details are in its folder ([token bucket](token_bucket/README.md), [leaky bucket](leaky_bucket/README.md), [sliding window log](sliding_window_log/README.md), [fixed window counter](fixed_window_counter/README.md)).
 
 ## Where the rate limiter sits
 
@@ -145,6 +145,19 @@ flowchart TB
 |-----------|----------|--------|---------|
 | Token bucket | A bucket per caller holds up to `bucket_size` tokens and refills at `refill_rate`/s. Each request takes a token; empty bucket → 429. One atomic Lua script in Redis. | Deployed, measured | [docs/token_bucket/README.md](token_bucket/README.md) |
 | Leaky bucket (queue) | Requests wait in an SQS FIFO line per tier; a worker processes them at a fixed rate (regular 1/s, business 5/s). Full line → 429. The client gets a job id and polls each second. Redis only counts who is waiting. Example: a chat agent. Deploy with `./scripts/deploy.sh dev us-east-1 leaky_bucket`. | Built, not deployed yet | [docs/leaky_bucket/README.md](leaky_bucket/README.md) |
+| Sliding window log | Redis keeps the time of each allowed request (a sorted set per caller). Allowed only if fewer than `limit` in the last `window_s`. Exact, but one entry per request. Deploy with `sliding_window_log` as the 3rd argument. | Built, not deployed yet | [docs/sliding_window_log/README.md](sliding_window_log/README.md) |
+| Fixed window counter | One counter per caller per fixed window (e.g. each whole second). Over `limit` → 429 until the window ends. Tiny memory, but up to 2 × limit around a boundary. Deploy with `fixed_window_counter` as the 3rd argument. | Built, not deployed yet | [docs/fixed_window_counter/README.md](fixed_window_counter/README.md) |
+
+### Algorithm comparison
+
+| | Token bucket | Leaky bucket (queue) | Sliding window log | Fixed window counter |
+|---|---|---|---|---|
+| How it limits | Tokens refill at a steady rate; each request takes one | Requests wait in a line; processed at a fixed rate | Count of requests in the last `window_s`, from now | Count of requests in the current fixed window |
+| Bursts allowed | Yes, up to `bucket_size` | No: spread out (extra waits, full line → 429) | No: never more than `limit` in any window | Up to 2 × `limit` around a boundary |
+| Accuracy | Good | Exact pace | Exact | Rough at boundaries |
+| Memory per caller | ~200 B (one hash) | Per waiting job | ~80 B per request in the window (ip at limit 20 ≈ 1.5–2 KB) | ~200 B (one number) |
+| Redis structure | Hash `{t, ts}` | Counters + job hashes (queue in SQS) | Sorted set | String counter |
+| Best for | APIs that allow short bursts | Smooth load on a slow backend (e.g. chat agent) | Strict limits where precision matters | Simple, cheap limits at high scale |
 
 ## Code and container layout
 
@@ -156,24 +169,34 @@ src/
 │   ├── docker-compose.yml   ← router + one limiter per language + Redis
 │   ├── token_bucket.lua     ← the algorithm (runs atomically in Redis, multi-bucket)
 │   ├── rules.yaml           ← default rules (uploaded to S3 on deploy)
-│   ├── router/nginx.conf    ← nginx: routes /python, /go, /node (also used by leaky_bucket)
+│   ├── router/nginx.conf    ← nginx: routes /python, /go, /node (also used by the other three)
 │   ├── python/              ← app.py, requirements.txt, Dockerfile
 │   ├── go/                  ← main.go, go.mod, Dockerfile (go.sum made at build)
 │   └── node/                ← server.js, package.json, package-lock.json, Dockerfile
-└── leaky_bucket/
-    ├── docker-compose.yml   ← router + Redis + one limiter and one worker per language
-    ├── accept.lua           ← the door guard: tier, line count, ticket (runs atomically in Redis)
-    ├── finish.lua           ← job bookkeeping: processing / done / failed / expired
-    ├── rules.yaml           ← tiers, queue settings, poll limits (uploaded to S3 on deploy)
-    ├── python/              ← app.py (limiter), worker.py, common.py, requirements.txt, 2 Dockerfiles
-    ├── go/                  ← main.go, limiter.go, worker.go, common.go, go.mod, 2 Dockerfiles (one binary, two modes)
-    └── node/                ← server.js (limiter), worker.js, common.js, package files, 2 Dockerfiles
+├── leaky_bucket/
+│   ├── docker-compose.yml   ← router + Redis + one limiter and one worker per language
+│   ├── accept.lua           ← the door guard: tier, line count, ticket (runs atomically in Redis)
+│   ├── finish.lua           ← job bookkeeping: processing / done / failed / expired
+│   ├── rules.yaml           ← tiers, queue settings, poll limits (uploaded to S3 on deploy)
+│   ├── python/              ← app.py (limiter), worker.py, common.py, requirements.txt, 2 Dockerfiles
+│   ├── go/                  ← main.go, limiter.go, worker.go, common.go, go.mod, 2 Dockerfiles (one binary, two modes)
+│   └── node/                ← server.js (limiter), worker.js, common.js, package files, 2 Dockerfiles
+├── sliding_window_log/
+│   ├── docker-compose.yml   ← router + one limiter per language + Redis
+│   ├── sliding_window_log.lua ← the algorithm: one sorted-set log per caller
+│   ├── rules.yaml           ← limits and windows (uploaded to S3 on deploy)
+│   └── python/ go/ node/    ← one limiter server per language (copied from the token bucket)
+└── fixed_window_counter/
+    ├── docker-compose.yml   ← router + one limiter per language + Redis
+    ├── fixed_window_counter.lua ← the algorithm: one counter per caller per window
+    ├── rules.yaml           ← limits and windows (uploaded to S3 on deploy)
+    └── python/ go/ node/    ← one limiter server per language (copied from the token bucket)
 ```
 
 | Good to know | |
 |---|---|
-| Shared files | The leaky bucket reuses `router/nginx.conf` (mounted by its Compose file) and `token_bucket.lua` (for the polling limit) instead of copying them. Its Docker build context is `src/` for that reason. |
-| File maps | [Token bucket](token_bucket/CODE_STRUCTURE.md), [leaky bucket](leaky_bucket/CODE_STRUCTURE.md): every file and what it does. |
+| Shared files | The other three algorithms reuse `token_bucket/router/nginx.conf` (mounted by their Compose files). The leaky bucket also reuses `token_bucket.lua` (for the polling limit), so its Docker build context is `src/`. The two window algorithms build from their own folder. |
+| File maps | [Token bucket](token_bucket/CODE_STRUCTURE.md), [leaky bucket](leaky_bucket/CODE_STRUCTURE.md), [sliding window log](sliding_window_log/CODE_STRUCTURE.md), [fixed window counter](fixed_window_counter/CODE_STRUCTURE.md): every file and what it does. |
 | What goes to GitHub | Only source files and Dockerfiles (each ~10–20 lines). Images are built on the EC2 and never committed. |
 
 ## Latency measurement
@@ -215,7 +238,7 @@ Parked: fail open vs fail closed.
 |----------|--------|--------------|-----|
 | Rate limiter placement | Middleware between client and servers | Client side, server side | Can't be bypassed, keeps rejected traffic off the backend, separates limits from business logic |
 | Backend | AWS Lambda (test stand-in for a real server) | | Cheap for testing |
-| Algorithm | Token bucket (bucket size, refill rate), then leaky bucket as a queue | | Token bucket first; leaky bucket second, same router, Redis and EC2, selected by the `Algorithm` stack parameter |
+| Algorithm | Token bucket (bucket size, refill rate), then leaky bucket as a queue, then sliding window log and fixed window counter (limit, window) | | Same router, Redis and EC2 for all four, selected by the `Algorithm` stack parameter |
 | Leaky bucket queue | SQS FIFO, one queue per language and tier | Redis list on the EC2 | Queue lives outside the instance, strict order, built-in retries and dead-letter queue |
 | Who sets the leak rate | The worker (one pacing loop per tier) | Redis delaying the reply | The worker starts one job every `1 / leak_rate` s; Redis only does bookkeeping |
 | Limiter compute (phase 1) | One EC2 + Docker Compose | Lambda | Behaves like the real long-running server; no cold starts or VPC complexity |
