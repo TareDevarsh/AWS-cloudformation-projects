@@ -26,15 +26,7 @@ flowchart LR
 |---|---|---|
 | Extra traffic | Cut off | Waits in line (up to a limit) |
 | Allowed bursts | Go through at once | Spread out |
-| What the backend sees | Bursts | An even pace |
 
-Like a coffee shop:
-
-| Coffee shop | Here | Job |
-|-------------|------|-----|
-| The line | SQS | Holds waiting requests in order |
-| The barista | Worker | Their speed is the leak rate |
-| The door guard | Redis | Counts how many each customer has in line |
 
 ## Tiers
 
