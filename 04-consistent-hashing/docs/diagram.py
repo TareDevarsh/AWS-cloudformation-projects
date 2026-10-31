@@ -49,7 +49,7 @@ def ring_axes(ax, title):
     ax.text(*xy(-5, 1.45), "clockwise", ha="center", fontsize=8, color="#999")
 
 
-def draw_nodes(ax, servers, keys, highlight=(), new=(), crossed=()):
+def draw_nodes(ax, servers, keys, highlight=(), new=(), crossed=(), crossed_label="removed"):
     for name, deg in servers.items():
         c = NEW_COLOR if name in new else S_COLOR
         ax.plot(*xy(deg), "s", ms=16, color=c, zorder=3)
@@ -58,7 +58,7 @@ def draw_nodes(ax, servers, keys, highlight=(), new=(), crossed=()):
         deg = SERVERS[name]
         ax.plot(*xy(deg), "s", ms=16, color="#bbb", zorder=3)
         ax.plot(*xy(deg), "x", ms=18, mew=3, color=HI_COLOR, zorder=4)
-        ax.text(*xy(deg, 1.2), name + "\n(removed)", ha="center", va="center", fontsize=10, color="#999")
+        ax.text(*xy(deg, 1.2), f"{name}\n({crossed_label})", ha="center", va="center", fontsize=10, color="#999")
     for name, deg in keys.items():
         c = HI_COLOR if name in highlight else K_COLOR
         ax.plot(*xy(deg), "o", ms=12, color=c, zorder=3)

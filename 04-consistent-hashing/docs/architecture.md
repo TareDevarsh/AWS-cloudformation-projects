@@ -54,7 +54,7 @@ Keys are hashed with the same function and placed on the same ring. There is **n
 
 ![Servers and keys on the ring](images/ring_keys.png)
 
-The problem this solves: the SHA-1 space has 2^160 values, far too many to map each one to a server in a lookup table. Instead, only the actual servers and keys are put on the ring, and their positions alone decide which server owns which key. The number of servers no longer appears in the formula, so changing it does not reshuffle everything.
+The problem this solves: the SHA-1 space has 2^160 values, far too many to map each one to a server in a lookup table. Hashing the key gives every key a deterministic position on the ring, so there is no per-key lookup table either. The ring itself only stores the sorted positions of the servers; a binary search on that list finds the next server clockwise from a key's position. The number of servers no longer appears in the formula, so changing it does not reshuffle everything.
 
 ## 5. Server lookup
 
@@ -89,4 +89,4 @@ The basic approach so far:
 1. Map servers and keys onto the ring with one uniform hash function.
 2. A key belongs to the first server clockwise from it.
 
-The next part covers the problems with this basic approach, such as uneven partition sizes and uneven key spread when servers are added or removed, and how virtual nodes fix them.
+Phase 2 covers the problems with this basic approach, such as uneven partition sizes and uneven key spread when servers are added or removed, how virtual nodes fix them, and the key-value store built on top. Start with [part 1: partitioning](kv-1-partitioning.md).
