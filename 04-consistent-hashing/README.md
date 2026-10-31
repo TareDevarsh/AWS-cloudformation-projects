@@ -9,15 +9,16 @@
 ![Architecture](docs/images/architecture.png)
 
 ## Summary
-A consistent hashing ring with virtual nodes, stored in DynamoDB and served by a Lambda behind an IAM-authorized API. You add and remove servers, and the API tells you which server owns any key, which key ranges changed owner, and how much of the ring each server holds. The design docs (concepts, then a Dynamo/Cassandra-style key-value store) explain the theory. Step 1 built the ring and routing. Step 2 added a key-value store on top: each key is written to N replicas (the first N distinct servers clockwise) with a write quorum W and read quorum R, and you can mark servers down to watch quorums succeed or fail. Step 3 replaces the integer version with a **vector clock**: writes carry a clock keyed by the coordinating server, a read returns every concurrent sibling plus an opaque `context`, and the coordinator detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy stand-in for both writes and reads, so a write still reaches W and a read during the outage still sees the fresh value. A stand-in write stores a **hint** naming the down primary; when the primary comes back (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**).
+A consistent hashing ring with virtual nodes, stored in DynamoDB and served by a Lambda behind an IAM-authorized API. You add and remove servers, and the API tells you which server owns any key, which key ranges changed owner, and how much of the ring each server holds. The design docs (concepts, then a Dynamo/Cassandra-style key-value store) explain the theory. Step 1 built the ring and routing. Step 2 added a key-value store on top: each key is written to N replicas (the first N distinct servers clockwise) with a write quorum W and read quorum R, and you can mark servers down to watch quorums succeed or fail. Step 3 replaces the integer version with a **vector clock**: writes carry a clock keyed by the coordinating server, a read returns every concurrent sibling plus an opaque `context`, and the coordinator detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy stand-in for both writes and reads, so a write still reaches W and a read during the outage still sees the fresh value. A stand-in write stores a **hint** naming the down primary; when the primary comes back (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Step 5 handles **permanent** failures with **anti-entropy repair**: each server summarises its data for a key range as a **Merkle tree** (keys hashed into 16 buckets, bucket hashes built pairwise to a root). `POST /repair` compares two servers' roots and, walking only the differing branches, merges and writes back just the keys in the buckets that differ — so the work moves with the differences, not the data size. `GET /merkle/{serverId}` exposes a tree for side-by-side inspection, and a scheduled EventBridge rule runs the same repair over adjacent replica pairs in the background.
 
 | Fact | Value |
 |------|-------|
-| Status | 🟡 Prototype: step 4, sloppy quorum + hinted handoff for temporary failures (not deployed yet) |
-| AWS services | API Gateway (REST) · Lambda (Python 3.12) · DynamoDB · IAM · CloudWatch Logs |
+| Status | 🟡 Prototype: step 5, Merkle-tree anti-entropy repair for permanent failures (not deployed yet) |
+| AWS services | API Gateway (REST) · Lambda (Python 3.12) · DynamoDB · EventBridge · IAM · CloudWatch Logs |
 | Quorum | N=3, W=2, R=2 by default (stack parameters); per-request `?w=` / `?r=` overrides; sloppy stand-ins |
 | Versioning | Vector clock per version; `MaxClockEntries`=10 threshold; server-side LWW on conflict |
-| Failure handling | Stand-in on a down primary; hint (`hintFor`) replayed on `/up` or `POST /hints/replay`, bounded + idempotent |
+| Temporary failures | Stand-in on a down primary; hint (`hintFor`) replayed on `/up` or `POST /hints/replay`, bounded + idempotent |
+| Permanent failures | Merkle-tree anti-entropy: `POST /repair` + scheduled EventBridge pass; `MerkleBuckets`=16; moves only differing buckets |
 | Auth | IAM / SigV4 on every method, client managed policy output |
 | Infra as code | [`infrastructure/template.yaml`](infrastructure/template.yaml) |
 | Cost at idle | ~$0 (on-demand DynamoDB, pay-per-request Lambda and API Gateway) |
@@ -31,10 +32,11 @@ flowchart LR
     Policy[Client managed policy<br/>execute-api:Invoke] -.attached to.-> Client
     Api -->|/servers · /route · /down| Fn[ring Lambda<br/>SHA-1 + binary search<br/>add / remove / down]
     Fn -->|Query / PutItem / UpdateItem / BatchWriteItem| Table[(DynamoDB ring table<br/>servers + vnodes + status)]
-    Api -->|/kv/key · /up · /hints/replay| Kv[kv coordinator Lambda<br/>sloppy N replicas, W/R quorum<br/>vector clocks + LWW · hinted handoff]
+    Api -->|/kv/key · /up · /hints/replay<br/>/repair · /merkle/id| Kv[kv coordinator Lambda<br/>sloppy N replicas, W/R quorum<br/>vector clocks + LWW · hinted handoff<br/>Merkle-tree repair]
+    Schedule[EventBridge rule<br/>rate schedule] -->|invoke scheduled-repair| Kv
     Kv -.->|Query ring + status · UpdateItem on /up| Table
-    Kv -->|parallel GetItem / conditional PutItem<br/>Scan for hints · replay| Data[(DynamoDB data table<br/>one item per replica<br/>sibling versions + rev + hintFor)]
-    Shared[src/shared/ring_math.py + vector_clock.py] -.copied into kv by deploy.sh.-> Kv
+    Kv -->|parallel GetItem / conditional PutItem<br/>Scan for hints · Query for repair| Data[(DynamoDB data table<br/>one item per replica<br/>sibling versions + rev + hintFor)]
+    Shared[src/shared/ring_math.py + vector_clock.py + merkle.py] -.copied into kv by deploy.sh.-> Kv
     Ring2[src/shared/ring_math.py] -.-> Fn
 ```
 
@@ -49,7 +51,9 @@ flowchart LR
 8. **Sloppy write** (`PUT /kv/{key}`): the coordinator writes to the sloppy target set and collects W acks. If fewer than W targets are healthy even after walking (not enough servers) it returns 503 without writing. Otherwise it builds the new clock = the request `context` clock (empty if absent) with the coordinator's entry incremented, then truncated to `MaxClockEntries`. Each target merges the version into its sibling list under a conditional write on `rev` with bounded retry (drop superseded versions, keep concurrent ones, ignore a write a stored version already descends from). A **stand-in** write also records a **hint**: the attribute `hintFor` on that stand-in's replica item, a JSON list of the down primaries it is holding writes for. The hinted value keeps its vector clock, so replay merges cleanly. The response's `acked`/`failed` entries flag each target with `standIn` and its intended `primary`. A PUT without context can be concurrent with existing data.
 9. **Sloppy read** (`GET /kv/{key}`): the read walks past down primaries to the same stand-ins, so it can read a value that currently lives only on a stand-in — the outage window a strict read would miss. It reads the target set in parallel, counts the first R responses, unions versions across primaries **and** stand-ins, and drops dominated versions. Each `replicas` entry carries a `role` of `primary` or `standIn` (with `standInFor`). If more than one concurrent version survives, `conflict.detected` is true and the coordinator resolves it **server-side by last-write-wins** (highest `timestamp`, tiebreak by highest coordinator serverId). The resolution is not written back (**no read repair**); the next PUT with the returned `context` collapses the siblings.
 10. **Hinted handoff (recovery)**: `POST /servers/{id}/up` marks the server up **and** replays hints destined for it — every stand-in item whose `hintFor` lists the server is written back to the now-up primary with a vector-clock merge, then removed from `hintFor` (the attribute is dropped when the list empties). `POST /hints/replay` does the same on demand (optional `{"serverId"}`; without it, every hint whose intended server is up). Replay is **idempotent** (vector-clock merge + conditional write prevent clobbering, so a second run is a no-op) and **bounded** per call (`HintScanLimit` items scanned, `HintReplayLimit` hand-offs; a `more` flag signals a remainder). `POST /servers/{id}/down` sets `status = down`; the data stays in place.
-11. If N is larger than the number of servers, all servers are used and the response reports the effective `n`. `w` and `r` overrides must be 1..N.
+11. **Anti-entropy repair (permanent failures)**: `POST /repair {serverA, serverB, range?}` builds a [Merkle tree](docs/kv-3-failure-handling.md#10-handling-permanent-failures-anti-entropy-with-merkle-trees) for each server's items (a key goes to bucket `SHA-1(key) mod MerkleBuckets`; a bucket hash covers each key's value **and** vector clock; parents are hashed pairwise to a root). If the roots match, nothing moves. Otherwise it walks only the differing branches to the differing bucket indices, and **only for keys in those buckets** merges the two sides by vector clock exactly like a read (drop dominated, keep concurrent siblings) and writes the merged set back to whichever side is missing or stale, via the same conditional-write merge, so a re-run is idempotent. The response reports `rootA`/`rootB`, `rootsMatch`, `differingBuckets`, `keysCompared` vs `keysRepaired`, and the resulting versions per repaired key — so "only differences move" is observable. Bounded by `REPAIR_KEY_LIMIT` keys and `MERKLE_SCAN_LIMIT` items read per server (`truncated`/`more` flag a remainder). `GET /merkle/{serverId}[?start=&end=]` returns a server's root and per-bucket leaf hashes for side-by-side inspection.
+12. **Scheduled background repair** (Option B): an EventBridge rule (`RepairScheduleRate`, default `rate(1 hour)`; toggle with `RepairScheduleEnabled`) invokes the kv Lambda with `{"source": "scheduled-repair"}`. The handler repairs each **adjacent replica pair** on the ring (the servers whose preference lists overlap, so the ones most likely to share keys and drift), reusing the same `repair()` path, bounded by `REPAIR_PAIR_LIMIT` pairs. It needs no extra IAM: the scheduled path uses the existing ring-read + data read/write permissions.
+13. If N is larger than the number of servers, all servers are used and the response reports the effective `n`. `w` and `r` overrides must be 1..N.
 
 | Method | Path | Body | Result |
 |--------|------|------|--------|
@@ -62,6 +66,8 @@ flowchart LR
 | `PUT` | `/kv/{key}[?w=2][&coordinator=s0]` | `{"value": "...", "context": "<opaque>"}` | `200` ≥ W acks via the sloppy target set: `coordinator`, `clock`, `context`, `acked`/`failed` (each with `standIn`, `primary`) · `400` bad context / coordinator not in preference list · `503` fewer than W healthy targets or coordinator has no stand-in · `409` empty ring |
 | `GET` | `/kv/{key}[?r=2]` | | `200` winning `value`, `context`, `conflict` (`detected`, `versions`, `winner`, `discarded`) + every target's versions with `role` (`primary`/`standIn`, `standInFor`) · `404` not on the R targets counted · `503` fewer than R responses |
 | `POST` | `/hints/replay` | `{"serverId": "s0"}` (optional) | `200` `hintReplay` summary (`hintsReplayed`, `keysReplayed`, `byServer`, `more`) · `400` bad serverId · `409` named server is not up |
+| `POST` | `/repair` | `{"serverA": "s0", "serverB": "s1", "range": {"start": "<hex>", "end": "<hex>"}}` (range optional) | `200` repair summary (`rootA`, `rootB`, `rootsMatch`, `differingBuckets`, `keysCompared`, `keysRepaired`, `repaired[]`, `more`) · `400` bad serverId / equal servers / bad range |
+| `GET` | `/merkle/{serverId}[?start=&end=]` | | `200` `root`, per-bucket `leaves`, `buckets`, `keyCount`, `truncated` · `400` invalid serverId or only one of start/end |
 
 Validation: `serverId` is 1-64 chars of `A-Z a-z 0-9 _ . -`; `vnodes` is 1-500; route `key` is 1-256 bytes; `n` is 1-10. KV `key` is 1-256 chars of `A-Z a-z 0-9 _ . : -`; `value` is a string up to 10 KB; `w` and `r` are 1..N; `context` is base64url JSON of a vector clock, decoded size-limited to 4 KB and shape-checked.
 
@@ -98,12 +104,25 @@ More detail and the data model: [docs/workflow.md](docs/workflow.md).
 // POST /servers {"serverId": "s4", "vnodes": 100}
 {"serverId": "s4", "vnodesAdded": 100, "affectedRanges": 84,
  "ranges": [{"start": "02b1…", "end": "02f9…", "fromServer": "s1", "toServer": "s4"}, …]}
+
+// GET /merkle/s2   (16 buckets; most match a replica of the same range)
+{"serverId": "s2", "buckets": 16, "root": "9a4f…", "keyCount": 200, "truncated": false,
+ "leaves": ["da39…", "1b7c…", …]}
+
+// POST /repair {"serverA": "s0", "serverB": "s2"}   (s0 missed one write; only its bucket moves)
+{"serverA": "s0", "serverB": "s2", "buckets": 16, "rootA": "71e2…", "rootB": "9a4f…",
+ "rootsMatch": false, "totalKeysA": 199, "totalKeysB": 200,
+ "differingBuckets": [11], "keysCompared": 13, "keysRepaired": 1,
+ "repaired": [{"key": "user-37", "sides": ["s0"], "versions": [{"value": "mv2", "clock": {…}, …}]}],
+ "truncated": false, "more": false}
 ```
 </details>
 
 Local check of the ring code (4 servers x 100 vnodes, 10,000 keys): shares were 21-27% per server. Adding a 5th server moved 1,965 keys (19.6%), all to the new server. Removing a server moved only its own 2,173 keys.
 
 Local check of the coordinator (in-memory fake tables, N=3): replaying the docs' D1..D5 through the handler reproduced the documented clocks exactly — D3 `([Sx,2],[Sy,1])`, D4 `([Sx,2],[Sz,1])` (concurrent siblings), D5 `([Sx,3],[Sy,1],[Sz,1])` after a merge write. A GET over D3 and D4 reported `conflict.detected` with both versions and the LWW winner; the D5 write collapsed them so the next GET showed no conflict. For step 4 the same fake tables showed: a write with one primary down reaches W via a stand-in and records a `hintFor` naming the down primary; a sloppy read returns that value during the outage and flags the stand-in responder; `/up` replays the hint to the recovered primary and clears it; a second replay is a no-op (idempotent) and leaves a single version on the primary. Ancestor/concurrent comparisons, clock truncation at 10 entries, the LWW tiebreak, and the re-run step-2 quorum cases (W=2 with one down via stand-in, W=3 with too few live targets → 503, invalid coordinator rejected, `r` out of range → 400) all passed.
+
+Local check of step 5 (in-memory fake tables, 16 buckets): two identical servers (40 keys) produced equal Merkle roots and a repair that moved nothing. Diverging 3 of 200 keys per server made exactly 3 buckets differ (`[1, 11, 14]`); `/repair` then compared **34 keys** (the keys in those 3 buckets), not the 200 total — the efficiency property — repaired the 3, and the roots matched afterwards. Concurrent (sibling) versions were preserved on both sides rather than lost. A second repair pass repaired 0 (idempotent). Re-running the step-2 (W=2/W=3/`r` out of range), step-3 (D1..D5 clocks, conflict + LWW, D5 collapse) and step-4 (sloppy write/read via stand-in, `/up` hint replay, idempotent replay) checks through the handler all still passed — 22/22 total.
 
 ## Design docs
 <details><summary>Concepts and key-value store design (sections 1-17)</summary>
@@ -173,13 +192,14 @@ python3 docs/diagram_kv.py     # phase 2: writes docs/images/kv_*.png and prints
 │   ├── diagram_kv.py                  ← phase 2 concept images (kv_*.png)
 │   └── images/
 ├── infrastructure/
-│   └── template.yaml                  ← 2 DynamoDB tables, 2 Lambdas, REST API (AWS_IAM), client policy, N/W/R + MaxClockEntries + HintScan/ReplayLimit params
+│   └── template.yaml                  ← 2 DynamoDB tables, 2 Lambdas, REST API (AWS_IAM), EventBridge repair rule, client policy, N/W/R + MaxClockEntries + HintScan/ReplayLimit + MerkleBuckets + RepairSchedule params
 ├── src/
 │   ├── shared/
 │   │   ├── ring_math.py               ← pure ring functions, copied into both functions by deploy.sh
-│   │   └── vector_clock.py            ← pure vector-clock ops (compare, merge, truncate, context), into kv
+│   │   ├── vector_clock.py            ← pure vector-clock ops (compare, merge, truncate, context), into kv
+│   │   └── merkle.py                  ← pure Merkle-tree build + diff for anti-entropy repair, into kv
 │   ├── ring/handler.py                ← servers, routing, down API (/up is served by kv for replay)
-│   └── kv/handler.py                  ← sloppy quorum + vector clocks + LWW + hinted handoff: PUT/GET /kv/{key}, /up, /hints/replay
+│   └── kv/handler.py                  ← sloppy quorum + vector clocks + LWW + hinted handoff + Merkle repair: /kv/{key}, /up, /hints/replay, /repair, /merkle/{id}, scheduled
 ├── tests/
 │   └── integration/
 │       ├── sigv4.py                   ← stack outputs + SigV4-signed calls
@@ -201,11 +221,11 @@ python3 tests/integration/test_api.py dev
 ```
 
 ## Cost & security notes
-- **Cost:** on-demand DynamoDB, Lambda and API Gateway are pay-per-request, so idle cost is ~$0. Adding a 100-vnode server is 100 writes. A KV write is 1 ring Query + per target a GetItem plus a conditional PutItem (a couple more on write contention, bounded by retry); a read is 1 Query + up to N reads. A hint replay is 1 ring Query + a bounded data-table Scan plus a merge write per hint (bounded by `HintScanLimit`/`HintReplayLimit`); a `Scan` is used because the stand-in holding a hint is not known in advance.
+- **Cost:** on-demand DynamoDB, Lambda and API Gateway are pay-per-request, so idle cost is ~$0. Adding a 100-vnode server is 100 writes. A KV write is 1 ring Query + per target a GetItem plus a conditional PutItem (a couple more on write contention, bounded by retry); a read is 1 Query + up to N reads. A hint replay is 1 ring Query + a bounded data-table Scan plus a merge write per hint (bounded by `HintScanLimit`/`HintReplayLimit`); a `Scan` is used because the stand-in holding a hint is not known in advance. A `/repair` builds two Merkle trees (1 bounded data-table Query per server, `MerkleScanLimit` items) and writes back only the keys in differing buckets. The **scheduled** EventBridge rule runs a repair over adjacent replica pairs once per `RepairScheduleRate` (default hourly); each pass is bounded by `REPAIR_PAIR_LIMIT` pairs and `REPAIR_KEY_LIMIT` keys per pair, so steady-state cost (matching roots) is one Query per server per pair and no writes. Disable it with `RepairScheduleEnabled=DISABLED` to drop even that.
 - **Auth:** every method uses `AWS_IAM`; callers need the `ClientPolicyArn` managed policy (`execute-api:Invoke` on this stage only). Unsigned requests get 403.
-- **Least privilege:** one role per function. The ring role allows only `Query`, `GetItem`, `PutItem`, `DeleteItem`, `UpdateItem` and `BatchWriteItem` on the ring table. The kv role allows `Query` + `UpdateItem` on the ring table (it marks a server up on `/up`) and `GetItem`/`PutItem`/`Scan` on the data table (`Scan` finds stand-in items carrying hints). Each can write only to its own log group.
+- **Least privilege:** one role per function. The ring role allows only `Query`, `GetItem`, `PutItem`, `DeleteItem`, `UpdateItem` and `BatchWriteItem` on the ring table. The kv role allows `Query` + `UpdateItem` on the ring table (it marks a server up on `/up`) and `GetItem`/`PutItem`/`Scan`/`Query` on the data table (`Scan` finds stand-in items carrying hints; `Query` lists a server's items to build a Merkle tree for repair). Each can write only to its own log group. The scheduled repair reuses this same role, so it adds no new data permissions; only EventBridge is granted `lambda:InvokeFunction` on the kv function, scoped to the rule's ARN.
 - **Data:** both tables are encrypted at rest with point-in-time recovery on. Stage throttling is 10 rps, burst 20.
-- **Limits:** a prototype. Two concurrent add/remove calls can each report ranges computed from a stale ring, though the stored vnodes stay correct. Each key carries a vector clock, so concurrent writes become siblings instead of silently overwriting, but **server-side LWW conflict resolution can still silently drop a concurrent write**: it picks the version with the latest `timestamp`, so it relies on server clocks being close and loses the other value. Clock truncation at `MaxClockEntries` can make an ancestor look like a sibling, causing a false conflict (the known Dynamo trade-off). A write can partly succeed: targets that acked keep the value even when the response is 503. **Sloppy quorum weakens the `W + R > N` overlap** during an outage: a read may be served by a stand-in or miss a hint not yet replayed, so a stale value is possible until replay — this matches the eventual-consistency choice. Hinted handoff only covers temporary failures; if a stand-in is also lost the hint is lost (anti-entropy repair, a later step, is not built). Hint replay walks the data table with a `Scan` bounded per call, so a large backlog needs several `/hints/replay` calls (watch the `more` flag). Removing a server does not move its data, and there is no delete endpoint for keys, so integration-test items stay in the data table until the stack is deleted.
+- **Limits:** a prototype. Two concurrent add/remove calls can each report ranges computed from a stale ring, though the stored vnodes stay correct. Each key carries a vector clock, so concurrent writes become siblings instead of silently overwriting, but **server-side LWW conflict resolution can still silently drop a concurrent write**: it picks the version with the latest `timestamp`, so it relies on server clocks being close and loses the other value. Clock truncation at `MaxClockEntries` can make an ancestor look like a sibling, causing a false conflict (the known Dynamo trade-off). A write can partly succeed: targets that acked keep the value even when the response is 503. **Sloppy quorum weakens the `W + R > N` overlap** during an outage: a read may be served by a stand-in or miss a hint not yet replayed, so a stale value is possible until replay — this matches the eventual-consistency choice. Hinted handoff only covers temporary failures; if a stand-in is also lost, **Merkle-tree anti-entropy repair** (step 5, `/repair` and the scheduled pass) reconciles the permanent drift. Repair reads a server's items with a `Scan`-equivalent `Query` over its partition bounded by `MerkleScanLimit`, applies the range filter in-code (the data table is not indexed by ring position), and caps repaired keys per call, so a very large partition needs several `/repair` calls (watch `truncated`/`more`); the scheduled pass repairs only adjacent ring pairs, not every pair. Hint replay walks the data table with a `Scan` bounded per call, so a large backlog needs several `/hints/replay` calls (watch the `more` flag). Removing a server does not move its data, and there is no delete endpoint for keys, so integration-test items stay in the data table until the stack is deleted.
 
 ## What I learned / next steps
 - [x] Phase 1-2: concepts and key-value store design
@@ -213,7 +233,7 @@ python3 tests/integration/test_api.py dev
 - [x] Step 2: quorum reads and writes (N, W, R) on replicas, simulated server failure, integer versions
 - [x] Step 3: vector clocks, conflict detection, server-side last-write-wins resolution, coordinator + opaque context
 - [x] Step 4: sloppy quorum (writes + reads) via stand-ins, hinted handoff with replay on `/up` and `/hints/replay`
+- [x] Step 5: Merkle-tree anti-entropy repair for permanent failures (`/repair`, `/merkle/{id}`, scheduled EventBridge pass)
 - [ ] Read repair (write the resolved value back on read)
-- [ ] Merkle-tree anti-entropy repair for permanent failures
 - [ ] Gossip-based failure detection (replace the manual `/up` · `/down` switches)
 - [ ] Upgrade `01-key-value-store` with this design

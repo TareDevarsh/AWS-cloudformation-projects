@@ -1,7 +1,7 @@
 # Workflow · 04 Consistent Hashing
 [← Project README](../README.md)
 
-Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy **stand-in** for both writes and reads, a stand-in write records a **hint** (`hintFor`) naming the down primary, and when the primary returns (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Data is not moved when the ring changes.
+Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy **stand-in** for both writes and reads, a stand-in write records a **hint** (`hintFor`) naming the down primary, and when the primary returns (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Step 5 handles **permanent** failures with **Merkle-tree anti-entropy repair**: each server summarises its data as a Merkle tree (keys in `MerkleBuckets` leaf buckets, hashed pairwise to a root), and `POST /repair` compares two trees and reconciles only the keys in the buckets that differ. A scheduled EventBridge rule runs the same repair over adjacent replica pairs in the background. Data is not moved when the ring changes.
 
 ## Data model
 Two DynamoDB tables. The ring table has one partition per ring (`pk = RING#default`). Vnode sort keys are the zero-padded 40-hex-digit SHA-1 position, so a `Query` on `begins_with(sk, "VNODE#")` returns the ring already sorted clockwise.
@@ -32,7 +32,7 @@ erDiagram
     }
 ```
 
-The data table holds one item per replica: the same key on 3 servers is 3 items, `(s2, user-42)`, `(s0, user-42)`, `(s3, user-42)`. Each server gets its own partition, like one node's local storage. Each item stores a list of concurrent sibling versions, each with its own vector clock, plus a `rev` that backs an optimistic-concurrency conditional write so two coordinators writing the same replica item do not clobber each other. Ring math (`src/shared/ring_math.py`) and vector-clock ops (`src/shared/vector_clock.py`) are copied into the functions at package time.
+The data table holds one item per replica: the same key on 3 servers is 3 items, `(s2, user-42)`, `(s0, user-42)`, `(s3, user-42)`. Each server gets its own partition, like one node's local storage. Each item stores a list of concurrent sibling versions, each with its own vector clock, plus a `rev` that backs an optimistic-concurrency conditional write so two coordinators writing the same replica item do not clobber each other. Ring math (`src/shared/ring_math.py`), vector-clock ops (`src/shared/vector_clock.py`) and Merkle-tree build/diff (`src/shared/merkle.py`) are copied into the functions at package time. Repair reads a server's items with a `Query` over its partition and builds a tree keyed by `SHA-1(key) mod MerkleBuckets`, so the bucket a key lands in is the same on every server.
 
 ## Route a key
 ```mermaid
@@ -268,6 +268,54 @@ sequenceDiagram
 
 `POST /hints/replay` (optional body `{serverId}`) runs the same scan-and-hand-off on demand; without a `serverId` it replays every hint whose intended primary is up. It returns `409` if a named server is not up.
 
+## Merkle compare and selective repair (step 5)
+
+For permanent drift, `POST /repair` compares two servers with Merkle trees and reconciles **only** the keys in the buckets whose hashes differ. Equal roots mean no data is read beyond the two trees; otherwise the walk descends only differing branches to the differing bucket indices.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant K as kv Lambda
+    participant Da as Data (serverA)
+    participant Db as Data (serverB)
+    C->>K: POST /repair {serverA, serverB, range?} (SigV4)
+    K->>Da: Query serverA's items (bounded by MerkleScanLimit)
+    K->>Db: Query serverB's items
+    K->>K: build Merkle tree per server (bucket = SHA-1(key) mod MerkleBuckets)
+    alt rootA == rootB
+        K-->>C: 200 {rootsMatch:true, keysRepaired:0} (nothing read beyond the trees)
+    else roots differ
+        K->>K: diff: walk only differing branches -> differingBuckets
+        loop keys in a differing bucket (bounded by RepairKeyLimit)
+            K->>K: merge A+B versions by vector clock (drop dominated, keep siblings)
+            opt a side is missing or stale
+                K->>Da: write merged set (conditional on rev)
+                K->>Db: write merged set (conditional on rev)
+            end
+        end
+        Note over K: idempotent — once both sides hold the merged set, a re-run writes nothing
+        K-->>C: 200 {rootA, rootB, differingBuckets, keysCompared, keysRepaired, repaired[]}
+    end
+```
+
+`GET /merkle/{serverId}[?start=&end=]` returns a server's root and per-bucket leaf hashes so two trees can be lined up side by side without running a repair.
+
+## Scheduled background repair (step 5, Option B)
+
+An EventBridge rule invokes the kv Lambda on a schedule (`RepairScheduleRate`, default `rate(1 hour)`; toggle with `RepairScheduleEnabled`) with a constant `{"source": "scheduled-repair"}` event. The handler repairs each **adjacent replica pair** on the ring — the servers whose preference lists overlap — reusing the same `repair()` path, bounded by `REPAIR_PAIR_LIMIT` pairs.
+
+```mermaid
+flowchart LR
+    Rule[EventBridge rule<br/>RepairScheduleRate] -->|invoke scheduled-repair| Kv[kv Lambda<br/>scheduled_repair]
+    Kv -->|load ring| RT[(Ring table)]
+    Kv -->|for each adjacent server pair| Repair[repair pair<br/>Merkle compare + selective merge]
+    Repair -->|Query items · conditional writes| Data[(Data table)]
+    Repair -.->|roots match| Noop[no writes]
+```
+
+No new IAM: the scheduled path uses the kv role's existing ring-read and data read/write permissions; only EventBridge is granted `lambda:InvokeFunction` on the function, scoped to the rule ARN.
+
 ## Simulated failure
 
 `POST /servers/{id}/down` runs `UpdateItem SET status = down` (condition `attribute_exists`, else 404) through the ring Lambda. `POST /servers/{id}/up` is served by the **kv** Lambda instead, because bringing a server up also replays hinted-handoff writes to it (above), which needs data-table access. The kv Lambda reads `status` on every request, so a down/up change applies at once.
@@ -276,7 +324,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Staging: ./scripts/deploy.sh
-    Staging --> Lint: src/shared/*.py copied into each function (ring_math + vector_clock)
+    Staging --> Lint: src/shared/*.py copied into each function (ring_math + vector_clock + merkle)
     Lint --> Packaging: cfn-lint ok
     Lint --> [*]: errors
     Packaging --> Deploying: build/stage/src/{ring,kv} (handler + shared modules) uploaded
@@ -322,3 +370,10 @@ stateDiagram-v2
 | 27 | `POST /hints/replay` run twice | second pass hands off this key's hint 0 times (idempotent) |
 | 28 | `GET` after repeated replay | value unchanged, no conflict |
 | 29 | `POST /hints/replay` for a server that is down | 409 |
+| 30 | Diverge two replicas of a key, `GET /merkle/{A}` and `/merkle/{B}` | both return a `root` |
+| 31 | `POST /repair` on the diverged pair | 200, reports `rootA`/`rootB`, `differingBuckets`, repairs the key |
+| 32 | `GET /merkle` of each server after repair | roots now match |
+| 33 | `GET` the key after repair | reconciles to the latest value, no conflict |
+| 34 | `POST /repair` run again | idempotent: `rootsMatch`, `keysRepaired` 0 |
+| 35 | `POST /repair` with `serverA == serverB` | 400 |
+| 36 | Unsigned `POST /repair` | 403 |

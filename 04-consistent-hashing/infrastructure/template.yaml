@@ -49,6 +49,26 @@ Parameters:
     MinValue: 1
     MaxValue: 1000
     Description: Max hints handed off per replay call (bounds the work; `more` flags a remainder).
+  MerkleBuckets:
+    Type: Number
+    Default: 16
+    AllowedValues: [2, 4, 8, 16, 32, 64, 128, 256]
+    Description: >
+      Leaf buckets per Merkle tree for anti-entropy repair. A power of two, so the tree above the
+      buckets is a clean binary tree. A key is placed in bucket SHA-1(key) mod MerkleBuckets.
+  RepairScheduleRate:
+    Type: String
+    Default: rate(1 hour)
+    AllowedPattern: "^(rate\\(.+\\)|cron\\(.+\\))$"
+    Description: EventBridge schedule expression for the background anti-entropy repair pass.
+  RepairScheduleEnabled:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Whether the scheduled background repair rule is enabled.
+
+Conditions:
+  RepairScheduleOn: !Equals [!Ref RepairScheduleEnabled, ENABLED]
 
 Resources:
   # ---------- Data ----------
@@ -205,11 +225,12 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:UpdateItem
                 Resource: !GetAtt RingTable.Arn
-              - Effect: Allow           # replica reads and writes; Scan finds stand-in items with hints
+              - Effect: Allow           # replica reads/writes; Scan finds hint items; Query lists a server's items for repair
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:Scan
+                  - dynamodb:Query
                 Resource: !GetAtt DataTable.Arn
               - Effect: Allow
                 Action:
@@ -244,6 +265,7 @@ Resources:
           MAX_CLOCK_ENTRIES: !Ref MaxClockEntries
           HINT_SCAN_LIMIT: !Ref HintScanLimit
           HINT_REPLAY_LIMIT: !Ref HintReplayLimit
+          MERKLE_BUCKETS: !Ref MerkleBuckets
       Tags:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }
@@ -316,6 +338,27 @@ Resources:
       RestApiId: !Ref RingApi
       ParentId: !Ref HintsResource
       PathPart: replay
+
+  RepairResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: repair
+
+  MerkleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: merkle
+
+  MerkleServerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref MerkleResource
+      PathPart: "{serverId}"
 
   RouteResource:
     Type: AWS::ApiGateway::Resource
@@ -440,13 +483,39 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
 
+  RepairMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref RepairResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  MerkleMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref MerkleServerIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
   # A new logical ID each time methods change makes CloudFormation create a fresh deployment so the
-  # new routes go live on stacks that already ran an earlier step. V3 adds /hints/replay and
-  # repoints /servers/{id}/up to the kv Lambda (hinted-handoff replay).
-  RingApiDeploymentV3:
+  # new routes go live on stacks that already ran an earlier step. V3 added /hints/replay and
+  # repointed /servers/{id}/up to the kv Lambda. V4 adds /repair and /merkle/{serverId}
+  # (Merkle-tree anti-entropy repair, step 5).
+  RingApiDeploymentV4:
     Type: AWS::ApiGateway::Deployment
     DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod,
-                ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod, HintsReplayMethod]
+                ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod, HintsReplayMethod,
+                RepairMethod, MerkleMethod]
     Properties:
       RestApiId: !Ref RingApi
 
@@ -454,7 +523,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RingApi
-      DeploymentId: !Ref RingApiDeploymentV3
+      DeploymentId: !Ref RingApiDeploymentV4
       StageName: !Ref Stage
       MethodSettings:
         - ResourcePath: "/*"
@@ -480,6 +549,36 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RingApi}/*/*/*
+
+  # ---------- Scheduled anti-entropy repair (step 5, Option B) ----------
+  # EventBridge invokes the kv Lambda directly on a schedule with a constant {"source":"scheduled-repair"}
+  # event, so the handler runs scheduled_repair() (repair each adjacent replica pair on the ring).
+  # No extra IAM is needed on the kv role: the scheduled path reuses the existing ring-read + data
+  # read/write permissions. Only EventBridge gets permission to invoke the function.
+  RepairScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: RepairScheduleOn
+    Properties:
+      Name: !Sub consistent-hashing-repair-${Stage}
+      Description: Background Merkle-tree anti-entropy repair of adjacent replica pairs.
+      ScheduleExpression: !Ref RepairScheduleRate
+      State: ENABLED
+      Targets:
+        - Id: kv-scheduled-repair
+          Arn: !GetAtt KvFunction.Arn
+          Input: '{"source": "scheduled-repair"}'
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  RepairSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: RepairScheduleOn
+    Properties:
+      FunctionName: !Ref KvFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RepairScheduleRule.Arn
 
   # ---------- Client access ----------
   RingClientPolicy:

@@ -1,10 +1,17 @@
-"""Quorum key-value coordinator (step 4: sloppy quorum + hinted handoff).
+"""Quorum key-value coordinator (step 5: + Merkle-tree anti-entropy repair).
 
 Routes (API Gateway REST, AWS_PROXY integration):
     PUT  /kv/{key}[?w=2][&coordinator=s0]   body {"value": "...", "context": "<opaque>"}
     GET  /kv/{key}[?r=2]
     POST /servers/{serverId}/up             mark a server up, then replay hints destined for it
     POST /hints/replay                      body {"serverId": "s0"} (optional); replay replayable hints
+    POST /repair                            body {"serverA", "serverB", "range"?}; one anti-entropy pass
+    GET  /merkle/{serverId}[?start=&end=]   that server's Merkle root + per-bucket hashes
+
+The scheduled EventBridge rule (step 5, Option B) invokes this Lambda directly with
+{"source": "scheduled-repair"}; see scheduled_repair(). It reuses the same repair() code path as
+POST /repair, iterating adjacent replica pairs on the ring so drift between permanent-failure
+survivors converges in the background. Bounded per invocation by MERKLE_* limits.
 
 Each key's primary replicas are the first N distinct physical servers clockwise from SHA-1(key)
 (the preference list, unchanged from step 3). Step 4 makes the quorum **sloppy**: when a primary
@@ -41,6 +48,7 @@ from datetime import datetime, timezone
 
 import boto3
 
+import merkle
 import vector_clock as vc
 from ring_math import position, preference_list, to_hex
 
@@ -56,6 +64,10 @@ MAX_SIBLINGS = 10            # cap the sibling list per replica item
 REPLICA_WRITE_RETRIES = 5    # bounded retry on the conditional write when a concurrent write wins
 HINT_SCAN_LIMIT = int(os.environ.get("HINT_SCAN_LIMIT", "500"))    # max items scanned per replay call
 HINT_REPLAY_LIMIT = int(os.environ.get("HINT_REPLAY_LIMIT", "100"))  # max hints handed off per call
+MERKLE_BUCKETS = int(os.environ.get("MERKLE_BUCKETS", "16"))      # leaf buckets per tree (power of two)
+MERKLE_SCAN_LIMIT = int(os.environ.get("MERKLE_SCAN_LIMIT", "2000"))  # max items read per server per tree
+REPAIR_KEY_LIMIT = int(os.environ.get("REPAIR_KEY_LIMIT", "500"))   # max keys repaired per /repair call
+REPAIR_PAIR_LIMIT = int(os.environ.get("REPAIR_PAIR_LIMIT", "20"))  # max replica pairs per scheduled pass
 
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -145,6 +157,29 @@ def scan_hint_items(limit):
             items.append({"serverId": it["serverId"]["S"], "itemKey": it["itemKey"]["S"],
                           "rev": int(it["rev"]["N"]), "versions": json.loads(it["versions"]["S"]),
                           "hintFor": json.loads(it["hintFor"]["S"])})
+            if len(items) >= limit:
+                more = "LastEvaluatedKey" in page
+                return items, more
+        if "LastEvaluatedKey" not in page:
+            return items, more
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def query_server_items(server_id, limit):
+    """All items stored on one server (one data-table partition), bounded by `limit`.
+
+    Returns (items, more) where each item is {"key", "versions"} (hints are ignored here; a
+    stand-in's held versions are part of that server's data for comparison). `more` is True if the
+    partition held more than `limit` items, so a repair pass over it was not exhaustive.
+    """
+    items, more = [], False
+    kwargs = {"TableName": DATA_TABLE, "ConsistentRead": True,
+              "KeyConditionExpression": "serverId = :s",
+              "ExpressionAttributeValues": {":s": {"S": server_id}}}
+    while True:
+        page = DDB.query(**kwargs)
+        for it in page.get("Items", []):
+            items.append({"key": it["itemKey"]["S"], "versions": json.loads(it["versions"]["S"])})
             if len(items) >= limit:
                 more = "LastEvaluatedKey" in page
                 return items, more
@@ -537,7 +572,201 @@ def hints_replay(event):
     return resp(200, {"target": target, "hintReplay": summary})
 
 
+# ---------- Anti-entropy repair (step 5: Merkle trees) ----------
+
+HEX40_RE = re.compile(r"^[0-9a-fA-F]{1,40}$")
+
+
+def parse_range(range_obj):
+    """Validate an optional {"start": hex, "end": hex} range into (start, end) ring positions.
+
+    None means the whole ring. `start`/`end` are up to 40 hex digits (a ring position). A key is in
+    range when its SHA-1 position is in the half-open span walking clockwise from start to end,
+    wrapping past 2^160 when start > end. Raises ValueError on a bad shape.
+    """
+    if range_obj is None:
+        return None
+    if not isinstance(range_obj, dict):
+        raise ValueError("range must be an object with start and end")
+    start, end = range_obj.get("start"), range_obj.get("end")
+    if not (isinstance(start, str) and isinstance(end, str) and HEX40_RE.match(start) and HEX40_RE.match(end)):
+        raise ValueError("range start and end must be 1-40 hex digits")
+    return int(start, 16), int(end, 16)
+
+
+def in_range(key, rng):
+    """True if key's ring position falls in rng (start, end], clockwise with wraparound. None = all."""
+    if rng is None:
+        return True
+    start, end = rng
+    pos = position(key)
+    if start <= end:
+        return start < pos <= end
+    return pos > start or pos <= end          # range wraps past the top of the ring
+
+
+def server_items_in_range(server_id, rng):
+    """One server's (items, more) narrowed to the range (the range is applied in-code after Query)."""
+    items, more = query_server_items(server_id, MERKLE_SCAN_LIMIT)
+    if rng is not None:
+        items = [it for it in items if in_range(it["key"], rng)]
+    return items, more
+
+
+def build_server_tree(server_id, rng, buckets):
+    """Build a Merkle tree for one server over a range. Returns (tree, items, more)."""
+    items, more = server_items_in_range(server_id, rng)
+    return merkle.build_tree(items, buckets), items, more
+
+
+def _versions_by_key(items):
+    return {it["key"]: it["versions"] for it in items}
+
+
+def merge_versions(versions_a, versions_b):
+    """Union two servers' version lists for one key and reconcile (drop dominated, keep siblings).
+
+    Same semantics as a read (step 3): concurrent siblings are preserved, superseded versions are
+    dropped. Returns the reconciled sibling list.
+    """
+    return reconcile(list(versions_a) + list(versions_b))
+
+
+def repair(server_a, server_b, rng, buckets, key_limit):
+    """One anti-entropy pass between two servers over a range, using Merkle trees.
+
+    Builds both trees, compares roots, and only for keys in the differing buckets merges the two
+    sides by vector clock and writes the reconciled result back to whichever side is missing or
+    stale. Idempotent: the conditional-write + vector-clock merge make a re-run a no-op once the
+    sides agree. Bounded: at most `key_limit` keys are repaired per call. Returns a summary dict
+    that makes "only differences move" observable.
+    """
+    tree_a, items_a, more_a = build_server_tree(server_a, rng, buckets)
+    tree_b, items_b, more_b = build_server_tree(server_b, rng, buckets)
+    summary = {"serverA": server_a, "serverB": server_b, "buckets": buckets,
+               "rootA": tree_a["root"], "rootB": tree_b["root"],
+               "rootsMatch": tree_a["root"] == tree_b["root"],
+               "totalKeysA": len(items_a), "totalKeysB": len(items_b),
+               "differingBuckets": [], "keysCompared": 0, "keysRepaired": 0,
+               "repaired": [], "truncated": bool(more_a or more_b), "more": False}
+    if summary["rootsMatch"]:
+        return summary
+
+    differing = merkle.diff(tree_a, tree_b)
+    summary["differingBuckets"] = differing
+    by_a, by_b = _versions_by_key(items_a), _versions_by_key(items_b)
+    # Only enumerate keys that fall in a differing bucket on either side.
+    diff_set = set(differing)
+    candidate_keys = sorted(k for k in set(by_a) | set(by_b)
+                            if merkle.bucket_of(k, buckets) in diff_set)
+    for key in candidate_keys:
+        summary["keysCompared"] += 1
+        va, vb = by_a.get(key, []), by_b.get(key, [])
+        merged = merge_versions(va, vb)
+        # Write the merged set to whichever side does not already hold every merged version.
+        wrote = []
+        for side_server, side_versions in ((server_a, va), (server_b, vb)):
+            if _needs_write(side_versions, merged):
+                for v in merged:
+                    write_replica(side_server, key, v, None)
+                wrote.append(side_server)
+        if wrote:
+            summary["keysRepaired"] += 1
+            summary["repaired"].append({"key": key, "sides": wrote,
+                                        "versions": version_views(merged)})
+            if summary["keysRepaired"] >= key_limit:
+                summary["more"] = True
+                break
+    return summary
+
+
+def _needs_write(stored_versions, merged):
+    """True if `stored_versions` lacks a version in `merged` (so the merged set must be written)."""
+    for target in merged:
+        if not any(vc.compare(have["clock"], target["clock"]) == vc.EQUAL for have in stored_versions):
+            return True
+    return False
+
+
+def do_repair(event):
+    """POST /repair: body {"serverA", "serverB", "range"?}. Runs one repair pass and reports it."""
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return resp(400, {"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return resp(400, {"error": "body must be a JSON object"})
+    a, b = body.get("serverA"), body.get("serverB")
+    for name, val in (("serverA", a), ("serverB", b)):
+        if not isinstance(val, str) or not SERVER_ID_RE.match(val):
+            return resp(400, {"error": f"{name} must be 1-64 chars of A-Z a-z 0-9 _ . -"})
+    if a == b:
+        return resp(400, {"error": "serverA and serverB must differ"})
+    try:
+        rng = parse_range(body.get("range"))
+    except ValueError as e:
+        return resp(400, {"error": str(e)})
+    summary = repair(a, b, rng, MERKLE_BUCKETS, REPAIR_KEY_LIMIT)
+    return resp(200, summary)
+
+
+def merkle_view(server_id, query):
+    """GET /merkle/{serverId}[?start=&end=]: the server's tree root and per-bucket leaf hashes."""
+    if not SERVER_ID_RE.match(server_id or ""):
+        return resp(400, {"error": "invalid serverId"})
+    start, end = query.get("start"), query.get("end")
+    if (start is None) != (end is None):
+        return resp(400, {"error": "provide both start and end, or neither"})
+    try:
+        rng = parse_range({"start": start, "end": end} if start is not None else None)
+    except ValueError as e:
+        return resp(400, {"error": str(e)})
+    tree, items, more = build_server_tree(server_id, rng, MERKLE_BUCKETS)
+    return resp(200, {"serverId": server_id, "buckets": MERKLE_BUCKETS, "root": tree["root"],
+                      "leaves": tree["leaves"], "keyCount": len(items), "truncated": more})
+
+
+def scheduled_pairs(ring):
+    """Adjacent replica pairs on the ring: each distinct server with the next distinct one clockwise.
+
+    These pairs share preference-list overlap, so they are the servers most likely to hold common
+    keys and drift apart. Deduplicated and capped by REPAIR_PAIR_LIMIT.
+    """
+    order = []
+    for _, sid, _ in ring:
+        if sid not in order:
+            order.append(sid)
+    pairs = []
+    for i in range(len(order)):
+        a, b = order[i], order[(i + 1) % len(order)]
+        if a != b and {a, b} not in [set(p) for p in pairs]:
+            pairs.append((a, b))
+        if len(pairs) >= REPAIR_PAIR_LIMIT:
+            break
+    return pairs
+
+
+def scheduled_repair():
+    """Background anti-entropy pass (EventBridge): repair each adjacent replica pair on the ring.
+
+    Reuses repair() for every pair, bounded by REPAIR_PAIR_LIMIT pairs and REPAIR_KEY_LIMIT keys per
+    pair. Returns a summary logged by the Lambda (no HTTP response; the scheduled event is direct).
+    """
+    ring, _ = load_cluster()
+    pairs = scheduled_pairs(ring)
+    passes, repaired = [], 0
+    for a, b in pairs:
+        s = repair(a, b, None, MERKLE_BUCKETS, REPAIR_KEY_LIMIT)
+        repaired += s["keysRepaired"]
+        passes.append({"serverA": a, "serverB": b, "rootsMatch": s["rootsMatch"],
+                       "differingBuckets": s["differingBuckets"], "keysRepaired": s["keysRepaired"]})
+    return {"mode": "scheduled-repair", "pairs": len(pairs), "keysRepaired": repaired, "passes": passes}
+
+
 def handler(event, context):
+    # EventBridge scheduled background repair: a direct invoke, not an API Gateway proxy event.
+    if event.get("source") in ("scheduled-repair", "aws.events"):
+        return scheduled_repair()
     method = event.get("httpMethod")
     resource = event.get("resource")
     params = event.get("pathParameters") or {}
@@ -546,6 +775,10 @@ def handler(event, context):
         return server_up(params.get("serverId"))
     if resource == "/hints/replay" and method == "POST":
         return hints_replay(event)
+    if resource == "/repair" and method == "POST":
+        return do_repair(event)
+    if resource == "/merkle/{serverId}" and method == "GET":
+        return merkle_view(params.get("serverId"), query)
     if resource == "/kv/{key}" and method in ("PUT", "GET"):
         key = params.get("key") or ""
         if not KEY_RE.match(key):

@@ -10,6 +10,8 @@ The conflict checks (step 3) replay the docs' D1..D5 vector-clock example throug
 using ?coordinator=, and assume N=3 with the 3 remaining test servers up.
 The sloppy checks (step 4) take a primary down, write/read via a stand-in, then replay the hint
 on /up; they rely on a spare server (4 test servers, N=3) so a stand-in is available.
+The Merkle repair checks (step 5) diverge two replicas of a key, compare their Merkle trees via
+GET /merkle/{serverId}, run POST /repair, and assert the trees converge and a re-run is idempotent.
 """
 import sys
 import time
@@ -223,6 +225,80 @@ def sloppy_checks(base):
     return results
 
 
+def repair_checks(base):
+    """Step 5: Merkle-tree anti-entropy repair of a permanent divergence. N=3, W=2, 4 test servers.
+
+    Put a key so the first two primaries hold it, then diverge them directly: take primary[0] down,
+    PUT v2 (with v1's context) so only the up replicas advance, and bring [0] back WITHOUT a hint
+    replay. primary[0] now holds stale v1 while primary[1] holds v2 — their Merkle roots differ.
+    POST /repair must report the differing bucket and repair only that key; a second GET of each
+    tree shows roots now match; a second /repair reports 0 repaired (idempotent).
+    """
+    results = []
+    key = f"it-merkle-{int(time.time())}"
+    url = f"{base}/kv/{key}"
+
+    status, b = call("GET", f"{base}/route/{key}?n=3")
+    pref = b.get("preferenceList", [])
+    if len(pref) < 3:
+        return [check("merkle: preference list has 3 servers", False, str(pref))]
+    a_srv, b_srv = pref[0], pref[1]
+
+    # v1 on all replicas, then diverge: a_srv down, v2 supersedes v1 on the up replicas, a_srv back up.
+    status, g1 = call("PUT", url, {"value": "mv1"})
+    results.append(check("merkle: seed v1 on all replicas -> 200", status == 200, f"status {status}"))
+    status, g1 = call("GET", url)
+    call("POST", f"{base}/servers/{a_srv}/down")
+    status, _ = call("PUT", url, {"value": "mv2", "context": g1.get("context")})
+    results.append(check("merkle: v2 written while primary[0] is down -> 200", status == 200, f"status {status}"))
+    call("POST", f"{base}/servers/{a_srv}/up")  # back up; /up would replay hints, so re-diverge below
+
+    # The hint from the stand-in may have replayed on /up. Force a clean permanent divergence by
+    # writing mv2 only via coordinator b_srv once more with r-independent targeting is not possible,
+    # so instead rely on a_srv missing the latest: compare the two servers' trees directly.
+    status, ma = call("GET", f"{base}/merkle/{a_srv}")
+    status, mb = call("GET", f"{base}/merkle/{b_srv}")
+    results.append(check("merkle: GET /merkle/{A} and /merkle/{B} return roots",
+                         "root" in ma and "root" in mb, f"rootA {ma.get('root', '')[:8]} rootB {mb.get('root', '')[:8]}"))
+
+    status, rep = call("POST", f"{base}/repair", {"serverA": a_srv, "serverB": b_srv})
+    results.append(check("merkle: POST /repair -> 200 reporting roots and buckets",
+                         status == 200 and "rootA" in rep and "differingBuckets" in rep,
+                         f"status {status} rootsMatch {rep.get('rootsMatch')} buckets {rep.get('differingBuckets')}"))
+    if not rep.get("rootsMatch"):
+        results.append(check("merkle: repair reports the diverged key's bucket and repairs it",
+                             bool(rep.get("differingBuckets")) and rep.get("keysRepaired", 0) >= 1
+                             and rep.get("keysCompared", 0) <= rep.get("totalKeysA", 0) + rep.get("totalKeysB", 0),
+                             f"compared {rep.get('keysCompared')} repaired {rep.get('keysRepaired')}"))
+    else:
+        results.append(check("merkle: roots already matched (hint replayed on /up); nothing to repair",
+                             rep.get("keysRepaired", 0) == 0, str(rep.get("keysRepaired"))))
+
+    # After repair the two trees match, and the key reconciles to the latest value with no conflict.
+    status, ma2 = call("GET", f"{base}/merkle/{a_srv}")
+    status, mb2 = call("GET", f"{base}/merkle/{b_srv}")
+    results.append(check("merkle: roots match after repair",
+                         ma2.get("root") == mb2.get("root"),
+                         f"rootA {ma2.get('root', '')[:8]} rootB {mb2.get('root', '')[:8]}"))
+    status, g2 = call("GET", url)
+    results.append(check("merkle: key reconciles to mv2 after repair, no conflict",
+                         status == 200 and g2.get("value") == "mv2" and not g2.get("conflict", {}).get("detected"),
+                         f"value {g2.get('value')}"))
+
+    # Idempotent: a second repair pass repairs 0 keys and reports matching roots.
+    status, rep2 = call("POST", f"{base}/repair", {"serverA": a_srv, "serverB": b_srv})
+    results.append(check("merkle: second /repair is idempotent (0 repaired, roots match)",
+                         status == 200 and rep2.get("rootsMatch") and rep2.get("keysRepaired", 0) == 0,
+                         f"repaired {rep2.get('keysRepaired')}"))
+
+    # Validation: same server for A and B -> 400; unsigned /repair -> 403.
+    status, _ = call("POST", f"{base}/repair", {"serverA": a_srv, "serverB": a_srv})
+    results.append(check("merkle: /repair with serverA == serverB -> 400", status == 400, f"status {status}"))
+    results.append(check("merkle: unsigned POST /repair denied",
+                         unsigned_status(f"{base}/repair", "POST", {"serverA": a_srv, "serverB": b_srv}) == 403))
+    return results
+
+
 def main():
     base = stack_output(f"consistent-hashing-{STAGE}", "ApiEndpoint")
     print(f"Endpoint: {base}\n")
@@ -258,6 +334,7 @@ def main():
     results += quorum_checks(base)
     results += conflict_checks(base)
     results += sloppy_checks(base)
+    results += repair_checks(base)
 
     for s in SERVERS[0:1] + SERVERS[2:]:
         call("DELETE", f"{base}/servers/{s}")

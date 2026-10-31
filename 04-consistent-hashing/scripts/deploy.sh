@@ -2,6 +2,7 @@
 # Lint, package src/, and deploy the stack.
 # Usage: ./scripts/deploy.sh [stage] [region]
 #   QUORUM_N=3 QUORUM_W=2 QUORUM_R=2 MAX_CLOCK_ENTRIES=10 ./scripts/deploy.sh dev   # override defaults
+#   MERKLE_BUCKETS=16 REPAIR_SCHEDULE_RATE='rate(1 hour)' REPAIR_SCHEDULE_ENABLED=ENABLED ./scripts/deploy.sh dev
 #   BUILD_ONLY=1 ./scripts/deploy.sh                           # stage build/ only, no AWS calls
 set -euo pipefail
 
@@ -71,7 +72,9 @@ aws cloudformation deploy \
   --stack-name "$STACK" \
   --template-file "$PACKAGED" \
   --parameter-overrides "Stage=${STAGE}" "N=${QUORUM_N:-3}" "W=${QUORUM_W:-2}" "R=${QUORUM_R:-2}" \
-    "MaxClockEntries=${MAX_CLOCK_ENTRIES:-10}" \
+    "MaxClockEntries=${MAX_CLOCK_ENTRIES:-10}" "MerkleBuckets=${MERKLE_BUCKETS:-16}" \
+    "RepairScheduleRate=${REPAIR_SCHEDULE_RATE:-rate(1 hour)}" \
+    "RepairScheduleEnabled=${REPAIR_SCHEDULE_ENABLED:-ENABLED}" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
   --tags "Project=${PROJECT}" "Stage=${STAGE}"
