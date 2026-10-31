@@ -1,6 +1,6 @@
 # AWS CloudFormation Projects
 
-![Projects](https://img.shields.io/badge/projects-3-blue)
+![Projects](https://img.shields.io/badge/projects-4-blue)
 ![IaC](https://img.shields.io/badge/IaC-CloudFormation-FF4F8B?logo=amazonaws&logoColor=white)
 ![Auth](https://img.shields.io/badge/default%20auth-IAM%20SigV4-232F3E?logo=amazonaws&logoColor=white)
 ![Lint](https://img.shields.io/badge/cfn--lint-passing-brightgreen)
@@ -15,6 +15,7 @@ Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) 
 | 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
 | 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket, leaky bucket (SQS queue), sliding window log and fixed window counter (Redis), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
+| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Phase 1, concepts: the rehashing problem with `hash % n`, the hash ring, lookups, adding and removing servers | To be decided | ⚪ Planned |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -25,7 +26,7 @@ Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 </tr>
 <tr>
 <td width="50%" align="center"><a href="03-rate-limiter/"><img src="03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="03-rate-limiter/">03 · Rate Limiter</a></b></td>
-<td width="50%"></td>
+<td width="50%" align="center"><a href="04-consistent-hashing/"><img src="04-consistent-hashing/docs/images/ring_lookup.png" alt="04 Consistent Hashing ring lookup"/></a><br/><b><a href="04-consistent-hashing/">04 · Consistent Hashing</a></b></td>
 </tr>
 </table>
 
@@ -49,6 +50,8 @@ Every entry below is a link, so you can jump straight to the file.
     - [Template](03-rate-limiter/infrastructure/template.yaml) · [Code](03-rate-limiter/src/) · [Scripts](03-rate-limiter/scripts/)
     - Algorithms: [Token bucket](03-rate-limiter/docs/token_bucket/README.md) · [Leaky bucket](03-rate-limiter/docs/leaky_bucket/README.md) · [Sliding window log](03-rate-limiter/docs/sliding_window_log/README.md) · [Fixed window counter](03-rate-limiter/docs/fixed_window_counter/README.md)
     - [Live tests](03-rate-limiter/tests/integration/)
+  - 📦 **[04 · Consistent Hashing](04-consistent-hashing/)**
+    - [Architecture: concepts, sections 1-8](04-consistent-hashing/docs/architecture.md) · [Diagram script](04-consistent-hashing/docs/diagram.py)
 
 ```mermaid
 mindmap
@@ -61,6 +64,10 @@ mindmap
       Leaky bucket · SQS
       Sliding window log
       Fixed window counter
+    04 Consistent Hashing
+      Rehashing problem
+      Hash ring
+      Add / remove servers
 ```
 
 ## How each project is built
@@ -103,6 +110,9 @@ aws-projects/
 │   ├── src/                     ← token_bucket/, leaky_bucket/, sliding_window_log/, fixed_window_counter/, backend/
 │   ├── tests/integration/       ← latency.py, leaky_latency.py, window_latency.py
 │   └── scripts/                 ← deploy.sh, destroy.sh
+├── 04-consistent-hashing/
+│   ├── README.md                ← phase 1: concepts only
+│   └── docs/                    ← architecture.md, diagram.py, images/
 ├── docs/
 │   └── CONVENTIONS.md           ← folder rules, README order, diagram + security standards
 ├── _template/                   ← project skeleton with {{NN}} {{slug}} {{Title}} placeholders
@@ -139,6 +149,8 @@ graph TD
     FW --> FWC[CODE_STRUCTURE.md]
     A3 --> I3[infrastructure/template.yaml]
     W3 --> S3[scripts + tests]
+    R --> P4[04 README]
+    P4 --> A4[architecture.md]
 ```
 
 ## Reading guide (for reviewers)
