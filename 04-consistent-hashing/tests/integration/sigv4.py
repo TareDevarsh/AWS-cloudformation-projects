@@ -36,9 +36,10 @@ def call(method, url, body=None, region=REGION, service="execute-api"):
         return e.code, json.loads(e.read() or b"{}")
 
 
-def unsigned_status(url):
+def unsigned_status(url, method="GET", body=None):
+    data = json.dumps(body).encode() if body is not None else None
     try:
-        with urllib.request.urlopen(url) as resp:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, method=method)) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
         return e.code

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Lint, package src/, and deploy the stack.
 # Usage: ./scripts/deploy.sh [stage] [region]
+#   QUORUM_N=3 QUORUM_W=2 QUORUM_R=2 ./scripts/deploy.sh dev   # override the N/W/R defaults
+#   BUILD_ONLY=1 ./scripts/deploy.sh                           # stage build/ only, no AWS calls
 set -euo pipefail
 
 STAGE="${1:-dev}"
@@ -8,8 +10,24 @@ REGION="${2:-${AWS_REGION:-us-east-1}}"
 PROJECT="04-consistent-hashing"
 STACK="consistent-hashing-${STAGE}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="${DIR}/infrastructure/template.yaml"
+SRC_TEMPLATE="${DIR}/infrastructure/template.yaml"
 PACKAGED="${DIR}/build/packaged.yaml"
+
+# 0. Stage sources: build/stage mirrors infrastructure/ + src/, and each function folder
+#    gets a copy of src/shared/ring_math.py, so `Code: ../src/<fn>/` zips handler + shared module.
+STAGED="${DIR}/build/stage"
+rm -rf "$STAGED"
+mkdir -p "${STAGED}/infrastructure"
+cp "$SRC_TEMPLATE" "${STAGED}/infrastructure/template.yaml"
+for fn in ring kv; do
+  mkdir -p "${STAGED}/src/${fn}"
+  cp "${DIR}/src/${fn}/"*.py "${DIR}/src/shared/"*.py "${STAGED}/src/${fn}/"
+done
+TEMPLATE="${STAGED}/infrastructure/template.yaml"
+if [[ "${BUILD_ONLY:-0}" == "1" ]]; then
+  echo "Staged functions in ${STAGED}/src"
+  exit 0
+fi
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 BUCKET="cfn-artifacts-${ACCOUNT}-${REGION}"
@@ -51,7 +69,7 @@ aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK" \
   --template-file "$PACKAGED" \
-  --parameter-overrides "Stage=${STAGE}" \
+  --parameter-overrides "Stage=${STAGE}" "N=${QUORUM_N:-3}" "W=${QUORUM_W:-2}" "R=${QUORUM_R:-2}" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
   --tags "Project=${PROJECT}" "Stage=${STAGE}"

@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  04-consistent-hashing - Hash ring with virtual nodes.
-  API Gateway (REST, IAM auth) -> Lambda (Python) -> DynamoDB ring table (on-demand).
+  04-consistent-hashing - Hash ring with virtual nodes plus a quorum key-value store.
+  API Gateway (REST, IAM auth) -> ring Lambda + kv coordinator Lambda (Python)
+  -> DynamoDB ring table + data table (on-demand). N replicas, W/R quorum.
 
 Parameters:
   Stage:
@@ -9,11 +10,29 @@ Parameters:
     Default: dev
     AllowedValues: [dev, test, prod]
     Description: Deployment stage, used in names and tags.
+  N:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Replicas per key (first N distinct servers clockwise).
+  W:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Default write quorum (acks needed). Keep W <= N.
+  R:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Default read quorum (responses needed). Keep R <= N.
 
 Resources:
   # ---------- Data ----------
   # One partition per ring (pk = RING#default). Sort keys:
-  #   SERVER#<serverId>      -> serverId, vnodeCount
+  #   SERVER#<serverId>      -> serverId, vnodeCount, status (up | down, simulated failure)
   #   VNODE#<40-hex SHA-1>   -> serverId, vnodeIndex (sorted by position, so a Query returns the ring in order)
   RingTable:
     Type: AWS::DynamoDB::Table
@@ -30,6 +49,32 @@ Resources:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # One item per replica: serverId (partition) + itemKey (sort) -> value, version, updatedAt.
+  # A partition per simulated server mirrors one node's local storage.
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete            # prototype; switch to Retain for real data
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: serverId
+          AttributeType: S
+        - AttributeName: itemKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serverId
+          KeyType: HASH
+        - AttributeName: itemKey
           KeyType: RANGE
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
@@ -71,6 +116,7 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
                   - dynamodb:BatchWriteItem
                 Resource: !GetAtt RingTable.Arn
               - Effect: Allow
@@ -103,14 +149,83 @@ Resources:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }
       # Local path; `aws cloudformation package` zips it and uploads to S3.
+      # deploy.sh packages a staged copy with src/shared/ring_math.py added.
       Code: ../src/ring/
 
+  KvFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/consistent-hashing-kv-${Stage}
+      RetentionInDays: 14
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  KvFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: kv-coordinator-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow           # read the ring and server status only
+                Action: dynamodb:Query
+                Resource: !GetAtt RingTable.Arn
+              - Effect: Allow           # replica reads and writes
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt DataTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt KvFunctionLogGroup.Arn
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  KvFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: KvFunctionLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub consistent-hashing-kv-${Stage}
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt KvFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          RING_TABLE_NAME: !Ref RingTable
+          DATA_TABLE_NAME: !Ref DataTable
+          QUORUM_N: !Ref N
+          QUORUM_W: !Ref W
+          QUORUM_R: !Ref R
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+      # deploy.sh packages a staged copy with src/shared/ring_math.py added.
+      Code: ../src/kv/
   # ---------- API ----------
   RingApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
       Name: !Sub consistent-hashing-${Stage}
-      Description: Consistent hashing ring API (IAM/SigV4 auth)
+      Description: Consistent hashing ring + quorum KV API (IAM/SigV4 auth)
       EndpointConfiguration:
         Types: [REGIONAL]
       Tags:
@@ -130,6 +245,34 @@ Resources:
       RestApiId: !Ref RingApi
       ParentId: !Ref ServersResource
       PathPart: "{serverId}"
+
+  ServerDownResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref ServerIdResource
+      PathPart: down
+
+  ServerUpResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref ServerIdResource
+      PathPart: up
+
+  KvResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: kv
+
+  KvKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref KvResource
+      PathPart: "{key}"
 
   RouteResource:
     Type: AWS::ApiGateway::Resource
@@ -193,9 +336,60 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
 
-  RingApiDeployment:
+  ServerDownMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref ServerDownResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  ServerUpMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref ServerUpResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  PutKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref KvKeyResource
+      HttpMethod: PUT
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  GetKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref KvKeyResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  # Renamed from RingApiDeployment: a new logical ID makes CloudFormation create a fresh
+  # deployment so the step-2 methods go live on stacks that already ran step 1.
+  RingApiDeploymentV2:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod]
+    DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod,
+                ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod]
     Properties:
       RestApiId: !Ref RingApi
 
@@ -203,7 +397,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RingApi
-      DeploymentId: !Ref RingApiDeployment
+      DeploymentId: !Ref RingApiDeploymentV2
       StageName: !Ref Stage
       MethodSettings:
         - ResourcePath: "/*"
@@ -218,6 +412,14 @@ Resources:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref RingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RingApi}/*/*/*
+
+  KvFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KvFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RingApi}/*/*/*
@@ -242,7 +444,14 @@ Outputs:
     Description: DynamoDB table holding servers and virtual nodes
     Value: !Ref RingTable
   FunctionName:
+    Description: ring Lambda (servers, routing, up/down)
     Value: !Ref RingFunction
+  DataTableName:
+    Description: DynamoDB table holding one item per key replica
+    Value: !Ref DataTable
+  KvFunctionName:
+    Description: kv coordinator Lambda (quorum PUT/GET)
+    Value: !Ref KvFunction
   ClientPolicyArn:
     Description: Attach this managed policy to callers to grant execute-api:Invoke
     Value: !Ref RingClientPolicy

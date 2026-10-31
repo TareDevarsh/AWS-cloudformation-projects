@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""End-to-end test for the ring API using SigV4-signed requests.
+"""End-to-end test for the ring API and quorum KV API using SigV4-signed requests.
 
 Usage: python3 tests/integration/test_api.py [stage]
 Needs: boto3, credentials allowed to execute-api:Invoke (see ClientPolicyArn output).
 Run against an empty ring (the share check sums the test servers only).
 Uses server ids prefixed "it-" and removes them at the end.
+The quorum checks assume the default N=3, W=2, R=2 and a fresh key per run.
 """
 import sys
+import time
 import urllib.parse
 
 from sigv4 import call, stack_output, unsigned_status
@@ -27,6 +29,48 @@ def owners(base):
         _, b = call("GET", f"{base}/route/{urllib.parse.quote(k, safe='')}")
         out[k] = b.get("serverId")
     return out
+
+
+def quorum_checks(base):
+    """Step 2: N=3 replicas on the 3 remaining test servers, W=2, R=2, simulated failures."""
+    results = []
+    key = f"it-key-{int(time.time())}"
+    url = f"{base}/kv/{key}"
+    results.append(check("unsigned PUT /kv denied", unsigned_status(url, "PUT", {"value": "x"}) == 403))
+
+    status, b = call("PUT", url, {"value": "v1"})
+    pref = b.get("preferenceList", [])
+    results.append(check("put v1 -> 200, 3 acks", status == 200 and len(b.get("acked", [])) == 3,
+                         f"status {status} pref {pref}"))
+    status, b = call("GET", url)
+    results.append(check("get round-trip", status == 200 and b.get("value") == "v1", f"status {status}"))
+    if len(pref) < 3:
+        return results + [check("preference list has 3 servers", False, str(pref))]
+
+    call("POST", f"{base}/servers/{pref[0]}/down")
+    status, b = call("PUT", url, {"value": "v2"})
+    results.append(check("W=2, one replica down -> 200", status == 200 and pref[0] not in b.get("acked", [])
+                         and b.get("version") == 2, f"status {status} acked {b.get('acked')}"))
+
+    call("POST", f"{base}/servers/{pref[1]}/down")
+    status, b = call("PUT", url, {"value": "v3"})
+    results.append(check("W=2, two replicas down -> 503", status == 503, f"status {status}"))
+    call("POST", f"{base}/servers/{pref[1]}/up")
+    call("POST", f"{base}/servers/{pref[0]}/up")
+
+    # pref[0] missed v2. R=1 counts only the first replica, so it returns the stale value.
+    status, b = call("GET", f"{url}?r=1")
+    first = next((x for x in b.get("replicas", []) if x["serverId"] == pref[0]), {})
+    results.append(check("R=1 returns stale v1 from the replica that was down",
+                         status == 200 and b.get("value") == "v1" and first.get("version") == 1,
+                         f"value {b.get('value')}"))
+    status, b = call("GET", f"{url}?r=3")
+    results.append(check("R=3 returns latest v2 and lists the stale replica",
+                         status == 200 and b.get("value") == "v2" and b.get("staleReplicas") == [pref[0]],
+                         f"value {b.get('value')} stale {b.get('staleReplicas')}"))
+    status, _ = call("GET", f"{url}?r=9")
+    results.append(check("r out of range -> 400", status == 400, f"status {status}"))
+    return results
 
 
 def main():
@@ -60,6 +104,8 @@ def main():
     moved = [k for k in KEYS if before[k] != after[k]]
     results.append(check("only the removed server's keys moved",
                          bool(moved) and all(before[k] == SERVERS[1] for k in moved), f"{len(moved)} moved"))
+
+    results += quorum_checks(base)
 
     for s in SERVERS[0:1] + SERVERS[2:]:
         call("DELETE", f"{base}/servers/{s}")

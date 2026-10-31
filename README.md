@@ -15,7 +15,7 @@ Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) 
 | 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
 | 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket, leaky bucket (SQS queue), sliding window log and fixed window counter (Redis), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
-| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Hash ring with virtual nodes: route keys to servers, preference lists, affected ranges on add/remove. Design docs cover a Dynamo-style KV store | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
+| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Hash ring with virtual nodes plus a quorum KV store: N replicas, W/R quorum reads and writes, simulated server failure, affected ranges on add/remove. Design docs cover a Dynamo-style KV store | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -53,7 +53,7 @@ Every entry below is a link, so you can jump straight to the file.
   - 📦 **[04 · Consistent Hashing](04-consistent-hashing/)**
     - [Concepts, sections 1-8](04-consistent-hashing/docs/architecture.md) · [Workflows](04-consistent-hashing/docs/workflow.md)
     - KV store design: [Partitioning](04-consistent-hashing/docs/kv-1-partitioning.md) · [Replication](04-consistent-hashing/docs/kv-2-replication-consistency.md) · [Failures](04-consistent-hashing/docs/kv-3-failure-handling.md) · [System](04-consistent-hashing/docs/kv-4-system-architecture.md)
-    - [Template](04-consistent-hashing/infrastructure/template.yaml) · [Code: ring handler](04-consistent-hashing/src/ring/handler.py) · [Scripts](04-consistent-hashing/scripts/)
+    - [Template](04-consistent-hashing/infrastructure/template.yaml) · [Code: ring handler](04-consistent-hashing/src/ring/handler.py) · [Code: kv coordinator](04-consistent-hashing/src/kv/handler.py) · [Scripts](04-consistent-hashing/scripts/)
     - [Integration test](04-consistent-hashing/tests/integration/test_api.py)
 
 ```mermaid
@@ -73,6 +73,7 @@ mindmap
       Add / remove servers
       Virtual nodes · DynamoDB
       Routing API · preference list
+      Quorum N W R · replicas
 ```
 
 ## How each project is built
@@ -119,7 +120,7 @@ aws-projects/
 │   ├── README.md                ← summary, ring API, design-doc index
 │   ├── docs/                    ← architecture.md, kv-1…kv-4, workflow.md, diagram*.py, images/
 │   ├── infrastructure/          ← template.yaml
-│   ├── src/                     ← ring/handler.py
+│   ├── src/                     ← ring/, kv/, shared/ring_math.py
 │   ├── tests/integration/       ← test_api.py
 │   └── scripts/                 ← deploy.sh, destroy.sh
 ├── docs/

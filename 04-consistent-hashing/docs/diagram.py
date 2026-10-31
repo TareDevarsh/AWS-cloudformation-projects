@@ -20,8 +20,15 @@ with Diagram("04 · Consistent Hashing", filename=str(OUT), show=False,
     client = User("Client\n(SigV4)")
     with Cluster("AWS · stack consistent-hashing-<stage>"):
         policy = IAM("Client policy\nexecute-api:Invoke")
-        api = APIGateway("REST API\nAWS_IAM auth\n/servers · /route/{key}")
-        fn = Lambda("ring\nSHA-1 + binary search")
-        table = Dynamodb("Ring table\nservers + vnodes")
+        api = APIGateway("REST API\nAWS_IAM auth\n/servers · /route · /kv")
+        ring_fn = Lambda("ring\nSHA-1 + binary search\nup / down")
+        kv_fn = Lambda("kv coordinator\nN replicas · W/R quorum")
+        ring_table = Dynamodb("Ring table\nservers + vnodes + status")
+        data_table = Dynamodb("Data table\none item per replica")
+
     client >> Edge(style="dashed", label="attached") >> policy
-    client >> Edge(label="HTTPS") >> api >> fn >> Edge(label="Query / BatchWrite") >> table
+    client >> Edge(label="HTTPS") >> api
+    api >> Edge(label="/servers · /route") >> ring_fn >> Edge(label="Query / BatchWrite") >> ring_table
+    api >> Edge(label="/kv/{key}") >> kv_fn
+    kv_fn >> Edge(style="dashed", label="Query ring") >> ring_table
+    kv_fn >> Edge(label="parallel Get / Put x N") >> data_table
