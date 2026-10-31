@@ -1,7 +1,7 @@
 # Workflow · 04 Consistent Hashing
 [← Project README](../README.md)
 
-Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy **stand-in** for both writes and reads, a stand-in write records a **hint** (`hintFor`) naming the down primary, and when the primary returns (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Step 5 handles **permanent** failures with **Merkle-tree anti-entropy repair**: each server summarises its data as a Merkle tree (keys in `MerkleBuckets` leaf buckets, hashed pairwise to a root), and `POST /repair` compares two trees and reconciles only the keys in the buckets that differ. A scheduled EventBridge rule runs the same repair over adjacent replica pairs in the background. Data is not moved when the ring changes.
+Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy **stand-in** for both writes and reads, a stand-in write records a **hint** (`hintFor`) naming the down primary, and when the primary returns (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Step 5 handles **permanent** failures with **Merkle-tree anti-entropy repair**: each server summarises its data as a Merkle tree (keys in `MerkleBuckets` leaf buckets, hashed pairwise to a root), and `POST /repair` compares two trees and reconciles only the keys in the buckets that differ. A scheduled EventBridge rule runs the same repair over adjacent replica pairs in the background. Step 6 adds **simulated gossip failure detection**: servers carry a `heartbeat` counter they bump via `POST /gossip/heartbeat`, and a second scheduled rule ticks `POST /gossip/tick`, marking a server `down` when its heartbeat goes stale past `GossipFailureThreshold` and back `up` (replaying its hints, option A) when a fresh heartbeat lands — the algorithm is real, the peer-to-peer transport is simulated by the shared table plus the tick. Data is not moved when the ring changes.
 
 ## Data model
 Two DynamoDB tables. The ring table has one partition per ring (`pk = RING#default`). Vnode sort keys are the zero-padded 40-hex-digit SHA-1 position, so a `Query` on `begins_with(sk, "VNODE#")` returns the ring already sorted clockwise.
@@ -14,7 +14,9 @@ erDiagram
         string sk "SERVER#<serverId>"
         string serverId
         number vnodeCount "1-500, default 100"
-        string status "up | down (simulated failure)"
+        string status "up | down (manual or gossip-driven)"
+        number heartbeat "gossip counter, default 0 (step 6)"
+        number heartbeatUpdatedAt "epoch seconds of the last heartbeat (step 6)"
     }
     VNODE {
         string pk "RING#default"
@@ -316,6 +318,65 @@ flowchart LR
 
 No new IAM: the scheduled path uses the kv role's existing ring-read and data read/write permissions; only EventBridge is granted `lambda:InvokeFunction` on the function, scoped to the rule ARN.
 
+## Simulated gossip failure detection (step 6)
+
+Gossip state lives on each `SERVER#` row: a `heartbeat` counter and `heartbeatUpdatedAt`, next to the existing `status`. `POST /gossip/heartbeat {serverId}` is a node saying "I am alive" (bump the counter, stamp the time). A scheduled EventBridge rule (`GossipTickRate`, default `rate(1 minute)`) invokes the kv Lambda with `{"source": "gossip-tick"}`; `POST /gossip/tick` runs the same round on demand. The round reads the whole membership list and compares each server's heartbeat age to `GossipFailureThreshold`.
+
+This **simulates** gossip: the membership list, heartbeat counters, threshold and "newest heartbeat view" are the real algorithm, but there is no peer-to-peer message exchange — a logical server has no process, so heartbeats go to the shared table and one scheduled tick applies the threshold centrally.
+
+### Detecting a failure
+A server stops heartbeating (its process is gone). Its heartbeat age grows until it crosses the threshold; the next tick marks it `down`, and because the kv coordinator reads `status` on every request, the next write automatically fails over to a stand-in (step 4).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N0 as Node s0
+    participant N1 as Node s1 (failing)
+    participant E as EventBridge (gossip rule)
+    participant K as kv Lambda
+    participant RT as Ring table
+    N0->>K: POST /gossip/heartbeat {s0}
+    K->>RT: UpdateItem s0: heartbeat += 1, heartbeatUpdatedAt = now
+    N1->>K: POST /gossip/heartbeat {s1}
+    K->>RT: UpdateItem s1: heartbeat += 1, heartbeatUpdatedAt = now
+    Note over N1: s1 fails — no more heartbeats
+    E->>K: invoke {"source":"gossip-tick"}
+    K->>RT: Query SERVER# rows (membership list)
+    K->>K: for each: age = now - heartbeatUpdatedAt
+    Note over K: s1 age > GossipFailureThreshold and status up
+    K->>RT: UpdateItem s1: status = down
+    K-->>E: {markedDown:[s1], markedUp:[], members:[…age…]}
+    Note over K,RT: later PUT/GET read status=down and walk to a stand-in for s1 (step 4)
+```
+
+### Recovery and hint replay (option A)
+`s1` comes back and heartbeats again. Within the threshold the next tick marks it `up` **and** replays the hints held for it — the same hand-off `/servers/{id}/up` does — so a value written to a stand-in during the outage returns to `s1`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N1 as Node s1 (recovered)
+    participant E as EventBridge (gossip rule)
+    participant K as kv Lambda
+    participant RT as Ring table
+    participant D as Data table
+    N1->>K: POST /gossip/heartbeat {s1}
+    K->>RT: UpdateItem s1: heartbeat += 1, heartbeatUpdatedAt = now
+    E->>K: invoke {"source":"gossip-tick"}
+    K->>RT: Query SERVER# rows
+    Note over K: s1 is down but age <= threshold (fresh heartbeat)
+    K->>RT: UpdateItem s1: status = up
+    K->>D: Scan for hintFor items naming s1 (bounded)
+    loop each hint for s1
+        K->>D: merge the stand-in's versions into s1 (conditional on rev)
+        K->>D: remove s1 from that item's hintFor
+    end
+    K-->>E: {markedDown:[], markedUp:[s1], hintReplay:{s1:{hintsReplayed…}}}
+    Note over K: a second tick finds no stale/fresh transitions and replays nothing (idempotent)
+```
+
+Precedence over the manual switches: the tick drives `status` from the heartbeats, so on its next round it can override a manual `/down` (a still-heartbeating server comes back up) or a manual `/up` (a stale server goes down). To hold a server down under gossip, stop heartbeating it or set `GossipEnabled=DISABLED`.
+
 ## Simulated failure
 
 `POST /servers/{id}/down` runs `UpdateItem SET status = down` (condition `attribute_exists`, else 404) through the ring Lambda. `POST /servers/{id}/up` is served by the **kv** Lambda instead, because bringing a server up also replays hinted-handoff writes to it (above), which needs data-table access. The kv Lambda reads `status` on every request, so a down/up change applies at once.
@@ -377,3 +438,14 @@ stateDiagram-v2
 | 34 | `POST /repair` run again | idempotent: `rootsMatch`, `keysRepaired` 0 |
 | 35 | `POST /repair` with `serverA == serverB` | 400 |
 | 36 | Unsigned `POST /repair` | 403 |
+| 37 | Heartbeat 3 servers, `POST /gossip/tick` | 200, target not in `markedDown` |
+| 38 | `GET /gossip/members` after heartbeats | each server up with `heartbeat` ≥ 1 and an `age` |
+| 39 | Stop heartbeating one, wait past `threshold`, `tick` | that server in `markedDown` |
+| 40 | `GET /gossip/members` after the stale tick | that server `down`, `age` > threshold |
+| 41 | `PUT` while the server is detected down | 200, acked via a stand-in |
+| 42 | `GET` during the outage | 200, returns the fresh value from the stand-in |
+| 43 | Resume its heartbeat, `tick` | server in `markedUp`, `hintReplay[server].hintsReplayed` ≥ 1 |
+| 44 | `GET` after recovery | value now on the recovered primary (its row `found`, `role` primary) |
+| 45 | Second `POST /gossip/tick` | idempotent: no `markedUp`/`markedDown`, no `hintReplay` |
+| 46 | `POST /gossip/heartbeat` for an unknown server | 404 |
+| 47 | Unsigned `POST /gossip/tick` | 403 |

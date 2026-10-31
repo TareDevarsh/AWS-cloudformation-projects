@@ -12,6 +12,10 @@ The sloppy checks (step 4) take a primary down, write/read via a stand-in, then 
 on /up; they rely on a spare server (4 test servers, N=3) so a stand-in is available.
 The Merkle repair checks (step 5) diverge two replicas of a key, compare their Merkle trees via
 GET /merkle/{serverId}, run POST /repair, and assert the trees converge and a re-run is idempotent.
+The gossip checks (step 6) heartbeat servers and POST /gossip/tick to drive failure detection: a
+stale heartbeat past the threshold marks a server down (a write then fails over to a stand-in), and
+a fresh heartbeat marks it up and replays its hint (option A). They sleep for the deployed
+GossipFailureThreshold, so deploy with a small threshold (e.g. GOSSIP_FAILURE_THRESHOLD=5) to run fast.
 """
 import sys
 import time
@@ -299,6 +303,102 @@ def repair_checks(base):
     return results
 
 
+def gossip_checks(base):
+    """Step 6: simulated gossip failure detection. N=3, W=2, 3 test servers up (one spare of 4).
+
+    Heartbeat all three preference-list servers and tick -> all up in /gossip/members. Stop
+    heartbeating one, wait past the failure threshold (read live from /gossip/members) and tick ->
+    that server is marked down; a PUT then fails over to a stand-in (a sloppy write). Resume its
+    heartbeat and tick -> it is marked up AND its hint is replayed (option A), so the value lands on
+    the original server; a sloppy read confirms it. /gossip/members shows heartbeat/age/status
+    throughout. The wait honours the deployed GossipFailureThreshold; deploy with a small threshold
+    (e.g. GOSSIP_FAILURE_THRESHOLD=5) to keep this fast.
+    """
+    results = []
+    key = f"it-gossip-{int(time.time())}"
+    url = f"{base}/kv/{key}"
+
+    status, b = call("GET", f"{base}/route/{key}?n=3")
+    pref = b.get("preferenceList", [])
+    if len(pref) < 3:
+        return [check("gossip: preference list has 3 servers", False, str(pref))]
+    s_a, s_b, s_c = pref[0], pref[1], pref[2]
+    target = s_a  # the server we will let go stale
+
+    # Heartbeat all three, tick, and confirm the membership list shows them up.
+    for s in (s_a, s_b, s_c):
+        call("POST", f"{base}/gossip/heartbeat", {"serverId": s})
+    status, tk = call("POST", f"{base}/gossip/tick")
+    results.append(check("gossip: tick after heartbeats -> 200, target not marked down",
+                         status == 200 and target not in tk.get("markedDown", []),
+                         f"status {status} down {tk.get('markedDown')}"))
+    status, m = call("GET", f"{base}/gossip/members")
+    threshold = m.get("threshold", 90)
+    members = {mm["serverId"]: mm for mm in m.get("members", [])}
+    results.append(check("gossip: /gossip/members reports heartbeat/age/status for the 3 servers",
+                         status == 200 and all(s in members and members[s]["status"] == "up"
+                                               and members[s]["heartbeat"] >= 1
+                                               and members[s]["age"] is not None for s in (s_a, s_b, s_c)),
+                         f"threshold {threshold} members {[(s, members.get(s, {}).get('status'), members.get(s, {}).get('age')) for s in (s_a, s_b, s_c)]}"))
+
+    # Seed a value while all up, then let `target` go stale: keep the other two heartbeating, wait
+    # past the threshold, tick -> the stale server is detected down.
+    call("PUT", url, {"value": "gv1"})
+    wait = threshold + 3
+    print(f"      (gossip) sleeping {wait}s so {target}'s heartbeat goes stale past threshold {threshold}s")
+    time.sleep(wait)
+    call("POST", f"{base}/gossip/heartbeat", {"serverId": s_b})
+    call("POST", f"{base}/gossip/heartbeat", {"serverId": s_c})
+    status, tk = call("POST", f"{base}/gossip/tick")
+    results.append(check("gossip: tick after the heartbeat goes stale marks the server down",
+                         status == 200 and target in tk.get("markedDown", []),
+                         f"down {tk.get('markedDown')}"))
+    status, m = call("GET", f"{base}/gossip/members")
+    results.append(check("gossip: /gossip/members shows the stale server down with age > threshold",
+                         status == 200 and next((mm for mm in m["members"] if mm["serverId"] == target), {}).get("status") == "down",
+                         f"target {next((mm for mm in m['members'] if mm['serverId'] == target), {})}"))
+
+    # With the server detected down, a PUT fails over to a stand-in (step-4 behaviour), recording a hint.
+    status, w = call("PUT", url, {"value": "gv2", "context": None})
+    acked = w.get("acked", [])
+    standins = [a for a in acked if a.get("standIn")]
+    results.append(check("gossip: write fails over to a stand-in while the server is detected down",
+                         status == 200 and bool(standins),
+                         f"acked {[(a.get('serverId'), a.get('standIn')) for a in acked]}"))
+    status, g = call("GET", url)
+    results.append(check("gossip: sloppy read sees the value via the stand-in during the outage",
+                         status == 200 and g.get("value") == "gv2", f"value {g.get('value')}"))
+
+    # Resume the server's heartbeat and tick -> gossip marks it up AND replays its hint (option A).
+    call("POST", f"{base}/gossip/heartbeat", {"serverId": target})
+    status, tk = call("POST", f"{base}/gossip/tick")
+    replay = tk.get("hintReplay", {}).get(target, {})
+    results.append(check("gossip: tick after a fresh heartbeat marks the server up and replays its hint",
+                         status == 200 and target in tk.get("markedUp", [])
+                         and replay.get("hintsReplayed", 0) >= 1,
+                         f"up {tk.get('markedUp')} replay {replay}"))
+    status, g2 = call("GET", url)
+    primary_row = next((rr for rr in g2.get("replicas", [])
+                        if rr.get("serverId") == target and rr.get("role") == "primary"), None)
+    results.append(check("gossip: the recovered server now holds the value on its primary row",
+                         status == 200 and primary_row is not None and primary_row.get("found")
+                         and g2.get("value") == "gv2", f"primary row {primary_row}"))
+
+    # A second tick is idempotent: no new transitions, no further hand-offs.
+    status, tk2 = call("POST", f"{base}/gossip/tick")
+    results.append(check("gossip: a second tick is idempotent (no transitions, no replay)",
+                         status == 200 and not tk2.get("markedUp") and not tk2.get("markedDown")
+                         and not tk2.get("hintReplay"),
+                         f"up {tk2.get('markedUp')} down {tk2.get('markedDown')} replay {tk2.get('hintReplay')}"))
+
+    # Validation: heartbeat for an unknown server -> 404; unsigned tick -> 403.
+    status, _ = call("POST", f"{base}/gossip/heartbeat", {"serverId": "it-nope"})
+    results.append(check("gossip: heartbeat for an unknown server -> 404", status == 404, f"status {status}"))
+    results.append(check("gossip: unsigned POST /gossip/tick denied",
+                         unsigned_status(f"{base}/gossip/tick", "POST", {}) == 403))
+    return results
+
+
 def main():
     base = stack_output(f"consistent-hashing-{STAGE}", "ApiEndpoint")
     print(f"Endpoint: {base}\n")
@@ -335,6 +435,7 @@ def main():
     results += conflict_checks(base)
     results += sloppy_checks(base)
     results += repair_checks(base)
+    results += gossip_checks(base)
 
     for s in SERVERS[0:1] + SERVERS[2:]:
         call("DELETE", f"{base}/servers/{s}")

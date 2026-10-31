@@ -1,4 +1,4 @@
-"""Quorum key-value coordinator (step 5: + Merkle-tree anti-entropy repair).
+"""Quorum key-value coordinator (step 6: + simulated gossip failure detection).
 
 Routes (API Gateway REST, AWS_PROXY integration):
     PUT  /kv/{key}[?w=2][&coordinator=s0]   body {"value": "...", "context": "<opaque>"}
@@ -7,11 +7,23 @@ Routes (API Gateway REST, AWS_PROXY integration):
     POST /hints/replay                      body {"serverId": "s0"} (optional); replay replayable hints
     POST /repair                            body {"serverA", "serverB", "range"?}; one anti-entropy pass
     GET  /merkle/{serverId}[?start=&end=]   that server's Merkle root + per-bucket hashes
+    POST /gossip/heartbeat                  body {"serverId"}; the node says "I am alive"
+    POST /gossip/tick                       run one gossip detection round; report up/down transitions
+    GET  /gossip/members                    membership list: heartbeat, age and status per server
 
-The scheduled EventBridge rule (step 5, Option B) invokes this Lambda directly with
-{"source": "scheduled-repair"}; see scheduled_repair(). It reuses the same repair() code path as
-POST /repair, iterating adjacent replica pairs on the ring so drift between permanent-failure
-survivors converges in the background. Bounded per invocation by MERKLE_* limits.
+Two EventBridge rules invoke this Lambda directly (not via API Gateway). {"source": "scheduled-repair"}
+runs scheduled_repair() (step 5, Option B): the same repair() path over adjacent replica pairs on the
+ring so permanent-failure drift converges in the background. {"source": "gossip-tick"} runs
+gossip_tick() (step 6): one simulated-gossip detection round. Both are bounded per invocation.
+
+Step 6 simulates gossip failure detection. The algorithm is real: a membership list (the SERVER#
+rows), per-server heartbeat counters a node bumps via POST /gossip/heartbeat, and a failure
+threshold; a tick marks a server down when its heartbeat has gone stale and back up when a fresh
+heartbeat lands, propagating the latest heartbeat view. The peer-to-peer gossip transport is
+SIMULATED by the shared DynamoDB table plus the scheduled tick, because a logical server here has no
+long-lived process. Because the tick reads/writes the same `status` field sloppy quorum + hinted
+handoff already use, detection automatically drives failover (a down server is skipped for a
+stand-in) and recovery (marking a server up replays its hints, option A).
 
 Each key's primary replicas are the first N distinct physical servers clockwise from SHA-1(key)
 (the preference list, unchanged from step 3). Step 4 makes the quorum **sloppy**: when a primary
@@ -43,6 +55,7 @@ Versioning (vector clocks, conflict detection, server-side LWW) is unchanged fro
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -68,6 +81,10 @@ MERKLE_BUCKETS = int(os.environ.get("MERKLE_BUCKETS", "16"))      # leaf buckets
 MERKLE_SCAN_LIMIT = int(os.environ.get("MERKLE_SCAN_LIMIT", "2000"))  # max items read per server per tree
 REPAIR_KEY_LIMIT = int(os.environ.get("REPAIR_KEY_LIMIT", "500"))   # max keys repaired per /repair call
 REPAIR_PAIR_LIMIT = int(os.environ.get("REPAIR_PAIR_LIMIT", "20"))  # max replica pairs per scheduled pass
+# Simulated gossip failure detection (step 6). A server is marked down when its heartbeat has not
+# advanced for longer than the threshold; it is marked up again once a fresh heartbeat lands inside
+# the threshold. Kept well above the tick interval so a single late heartbeat is not a false positive.
+GOSSIP_FAILURE_THRESHOLD = int(os.environ.get("GOSSIP_FAILURE_THRESHOLD", "90"))  # seconds
 
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -104,6 +121,53 @@ def set_server_status(server_id, status):
             ConditionExpression="attribute_exists(sk)",
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues={":st": {"S": status}},
+        )
+        return True
+    except DDB.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+# ---------- Simulated gossip membership (step 6) ----------
+# Gossip state lives on the same SERVER# rows the ring uses: `heartbeat` (a monotonic counter the
+# node bumps to say "I am alive"), `heartbeatUpdatedAt` (epoch seconds of the last bump) and the
+# existing `status` (up | down). This SIMULATES gossip: the algorithm (membership list, heartbeat
+# counters, a failure threshold, and propagating the latest heartbeat view) is real, but the
+# peer-to-peer network transport is replaced by the shared DynamoDB table plus a scheduled tick,
+# because a logical server here has no long-lived process to run a real gossip loop.
+
+def now_epoch():
+    """Wall-clock epoch seconds. A single indirection so a local test can inject a fake clock."""
+    return int(time.time())
+
+
+def load_servers():
+    """Membership list: list of {serverId, status, heartbeat, heartbeatUpdatedAt} from SERVER# rows."""
+    members = []
+    kwargs = {"TableName": RING_TABLE, "KeyConditionExpression": "pk = :pk AND begins_with(sk, :p)",
+              "ExpressionAttributeValues": {":pk": {"S": RING_PK}, ":p": {"S": "SERVER#"}}}
+    while True:
+        page = DDB.query(**kwargs)
+        for item in page.get("Items", []):
+            members.append({
+                "serverId": item["serverId"]["S"],
+                "status": item.get("status", {}).get("S", "up"),
+                "heartbeat": int(item["heartbeat"]["N"]) if "heartbeat" in item else 0,
+                "heartbeatUpdatedAt": int(item["heartbeatUpdatedAt"]["N"]) if "heartbeatUpdatedAt" in item else 0,
+            })
+        if "LastEvaluatedKey" not in page:
+            return members
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def bump_heartbeat(server_id, now):
+    """Increment a server's heartbeat counter and set heartbeatUpdatedAt=now. False if unknown."""
+    try:
+        DDB.update_item(
+            TableName=RING_TABLE,
+            Key={"pk": {"S": RING_PK}, "sk": {"S": "SERVER#" + server_id}},
+            UpdateExpression="SET heartbeat = if_not_exists(heartbeat, :z) + :one, heartbeatUpdatedAt = :now",
+            ConditionExpression="attribute_exists(sk)",
+            ExpressionAttributeValues={":z": {"N": "0"}, ":one": {"N": "1"}, ":now": {"N": str(now)}},
         )
         return True
     except DDB.exceptions.ConditionalCheckFailedException:
@@ -572,6 +636,93 @@ def hints_replay(event):
     return resp(200, {"target": target, "hintReplay": summary})
 
 
+# ---------- Simulated gossip failure detection (step 6) ----------
+
+def gossip_heartbeat(event):
+    """POST /gossip/heartbeat {"serverId"}: the node says "I am alive".
+
+    Increments that server's heartbeat counter and stamps heartbeatUpdatedAt=now. 404 if unknown.
+    Stands in for a gossip heartbeat message; the detection round (tick) reads these counters.
+    """
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return resp(400, {"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return resp(400, {"error": "body must be a JSON object"})
+    server_id = body.get("serverId")
+    if not isinstance(server_id, str) or not SERVER_ID_RE.match(server_id):
+        return resp(400, {"error": "serverId must be 1-64 chars of A-Z a-z 0-9 _ . -"})
+    now = now_epoch()
+    if not bump_heartbeat(server_id, now):
+        return resp(404, {"error": f"server {server_id} not found"})
+    return resp(200, {"serverId": server_id, "heartbeatUpdatedAt": now})
+
+
+def detect(members, now, threshold):
+    """One detection round over the membership list (pure).
+
+    For each member, compare the age of its last heartbeat (now - heartbeatUpdatedAt) to the
+    threshold. If it is up but stale (age > threshold), it should go down. If it is down but fresh
+    (age <= threshold and it has a heartbeat), it should come back up. A server that has never
+    heartbeated (heartbeatUpdatedAt == 0) is left as-is, so a freshly added server is not marked
+    down before its first heartbeat. Returns (to_down, to_up, views) where views is the per-server
+    membership view with the computed age.
+    """
+    to_down, to_up, views = [], [], []
+    for m in members:
+        hb_at = m["heartbeatUpdatedAt"]
+        age = now - hb_at if hb_at else None
+        stale = age is not None and age > threshold
+        fresh = age is not None and age <= threshold
+        if m["status"] == "up" and stale:
+            to_down.append(m["serverId"])
+        elif m["status"] == "down" and fresh:
+            to_up.append(m["serverId"])
+        views.append({"serverId": m["serverId"], "status": m["status"],
+                      "heartbeat": m["heartbeat"], "heartbeatUpdatedAt": hb_at, "age": age})
+    return to_down, to_up, views
+
+
+def gossip_tick():
+    """One detection round: read the membership list, flip stale/fresh servers, report transitions.
+
+    Marking a recovered server up also replays its hints (option A), exactly like POST
+    /servers/{id}/up, so a value that landed on a stand-in during the outage returns to the primary.
+    Gossip precedence: the tick drives `status` from the heartbeats, so on the next round it can
+    override a manual /down or /up — a server a human marked down comes back up here if it is still
+    heartbeating within the threshold, and one marked up goes down if its heartbeat has gone stale.
+    """
+    now = now_epoch()
+    members = load_servers()
+    to_down, to_up, views = detect(members, now, GOSSIP_FAILURE_THRESHOLD)
+    for sid in to_down:
+        set_server_status(sid, "down")
+    replayed = {}
+    if to_up:
+        for sid in to_up:
+            set_server_status(sid, "up")
+        # Recompute the up set after the flips, then replay hints for each recovered server (option A).
+        up_servers = {m["serverId"] for m in load_servers() if m["status"] == "up"}
+        for sid in to_up:
+            replayed[sid] = replay_hints(sid, up_servers)
+    return {"mode": "gossip-tick", "now": now, "threshold": GOSSIP_FAILURE_THRESHOLD,
+            "markedDown": to_down, "markedUp": to_up, "hintReplay": replayed,
+            "members": views}
+
+
+def gossip_members():
+    """GET /gossip/members: the membership list with heartbeat, heartbeatUpdatedAt, age and status."""
+    now = now_epoch()
+    members = sorted(load_servers(), key=lambda m: m["serverId"])
+    out = []
+    for m in members:
+        hb_at = m["heartbeatUpdatedAt"]
+        out.append({"serverId": m["serverId"], "status": m["status"], "heartbeat": m["heartbeat"],
+                    "heartbeatUpdatedAt": hb_at, "age": (now - hb_at if hb_at else None)})
+    return resp(200, {"now": now, "threshold": GOSSIP_FAILURE_THRESHOLD, "members": out})
+
+
 # ---------- Anti-entropy repair (step 5: Merkle trees) ----------
 
 HEX40_RE = re.compile(r"^[0-9a-fA-F]{1,40}$")
@@ -764,13 +915,22 @@ def scheduled_repair():
 
 
 def handler(event, context):
-    # EventBridge scheduled background repair: a direct invoke, not an API Gateway proxy event.
+    # EventBridge direct invokes (not API Gateway proxy events). The gossip tick and the background
+    # repair each have their own rule and their own constant "source" value.
+    if event.get("source") == "gossip-tick":
+        return gossip_tick()
     if event.get("source") in ("scheduled-repair", "aws.events"):
         return scheduled_repair()
     method = event.get("httpMethod")
     resource = event.get("resource")
     params = event.get("pathParameters") or {}
     query = event.get("queryStringParameters") or {}
+    if resource == "/gossip/heartbeat" and method == "POST":
+        return gossip_heartbeat(event)
+    if resource == "/gossip/tick" and method == "POST":
+        return resp(200, gossip_tick())
+    if resource == "/gossip/members" and method == "GET":
+        return gossip_members()
     if resource == "/servers/{serverId}/up" and method == "POST":
         return server_up(params.get("serverId"))
     if resource == "/hints/replay" and method == "POST":

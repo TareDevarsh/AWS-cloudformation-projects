@@ -66,9 +66,29 @@ Parameters:
     Default: ENABLED
     AllowedValues: [ENABLED, DISABLED]
     Description: Whether the scheduled background repair rule is enabled.
+  GossipTickRate:
+    Type: String
+    Default: rate(1 minute)
+    AllowedPattern: "^(rate\\(.+\\)|cron\\(.+\\))$"
+    Description: EventBridge schedule expression for the simulated gossip failure-detection tick.
+  GossipFailureThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 86400
+    Description: >
+      Seconds without a fresh heartbeat before a server is marked down by the gossip tick (and the
+      max age at which a down server is marked up again). Kept above the tick interval (default
+      rate(1 minute)) so a single late heartbeat does not trigger a false "down".
+  GossipEnabled:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Whether the scheduled gossip failure-detection tick rule is enabled.
 
 Conditions:
   RepairScheduleOn: !Equals [!Ref RepairScheduleEnabled, ENABLED]
+  GossipOn: !Equals [!Ref GossipEnabled, ENABLED]
 
 Resources:
   # ---------- Data ----------
@@ -266,6 +286,7 @@ Resources:
           HINT_SCAN_LIMIT: !Ref HintScanLimit
           HINT_REPLAY_LIMIT: !Ref HintReplayLimit
           MERKLE_BUCKETS: !Ref MerkleBuckets
+          GOSSIP_FAILURE_THRESHOLD: !Ref GossipFailureThreshold
       Tags:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }
@@ -359,6 +380,34 @@ Resources:
       RestApiId: !Ref RingApi
       ParentId: !Ref MerkleResource
       PathPart: "{serverId}"
+
+  GossipResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: gossip
+
+  GossipHeartbeatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref GossipResource
+      PathPart: heartbeat
+
+  GossipTickResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref GossipResource
+      PathPart: tick
+
+  GossipMembersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref GossipResource
+      PathPart: members
 
   RouteResource:
     Type: AWS::ApiGateway::Resource
@@ -507,15 +556,52 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
 
+  GossipHeartbeatMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref GossipHeartbeatResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  GossipTickMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref GossipTickResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  GossipMembersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref GossipMembersResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
   # A new logical ID each time methods change makes CloudFormation create a fresh deployment so the
   # new routes go live on stacks that already ran an earlier step. V3 added /hints/replay and
   # repointed /servers/{id}/up to the kv Lambda. V4 adds /repair and /merkle/{serverId}
-  # (Merkle-tree anti-entropy repair, step 5).
-  RingApiDeploymentV4:
+  # (Merkle-tree anti-entropy repair, step 5). V5 adds /gossip/heartbeat, /gossip/tick and
+  # /gossip/members (simulated gossip failure detection, step 6).
+  RingApiDeploymentV5:
     Type: AWS::ApiGateway::Deployment
     DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod,
                 ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod, HintsReplayMethod,
-                RepairMethod, MerkleMethod]
+                RepairMethod, MerkleMethod, GossipHeartbeatMethod, GossipTickMethod, GossipMembersMethod]
     Properties:
       RestApiId: !Ref RingApi
 
@@ -523,7 +609,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RingApi
-      DeploymentId: !Ref RingApiDeploymentV4
+      DeploymentId: !Ref RingApiDeploymentV5
       StageName: !Ref Stage
       MethodSettings:
         - ResourcePath: "/*"
@@ -579,6 +665,38 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt RepairScheduleRule.Arn
+
+  # ---------- Scheduled gossip failure-detection tick (step 6) ----------
+  # A separate rule from the repair schedule: it runs on its own (faster) cadence and carries a
+  # different constant {"source":"gossip-tick"} event, so the handler runs gossip_tick() (one
+  # detection round over the membership list). Kept distinct so the gossip rate and the repair rate
+  # can be tuned independently and either can be disabled on its own. No extra IAM on the kv role:
+  # the tick reuses the existing ring read + status UpdateItem (to flip up/down) and, on recovery,
+  # the data read/write used by hint replay. Only EventBridge is granted invoke permission.
+  GossipTickRule:
+    Type: AWS::Events::Rule
+    Condition: GossipOn
+    Properties:
+      Name: !Sub consistent-hashing-gossip-${Stage}
+      Description: Simulated gossip failure-detection tick over the server membership list.
+      ScheduleExpression: !Ref GossipTickRate
+      State: ENABLED
+      Targets:
+        - Id: kv-gossip-tick
+          Arn: !GetAtt KvFunction.Arn
+          Input: '{"source": "gossip-tick"}'
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  GossipTickPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GossipOn
+    Properties:
+      FunctionName: !Ref KvFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GossipTickRule.Arn
 
   # ---------- Client access ----------
   RingClientPolicy:

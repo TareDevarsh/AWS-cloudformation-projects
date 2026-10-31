@@ -21,17 +21,19 @@ with Diagram("04 · Consistent Hashing", filename=str(OUT), show=False,
     client = User("Client\n(SigV4)")
     with Cluster("AWS · stack consistent-hashing-<stage>"):
         policy = IAM("Client policy\nexecute-api:Invoke")
-        api = APIGateway("REST API\nAWS_IAM auth\n/servers · /route · /kv\n/repair · /merkle")
+        api = APIGateway("REST API\nAWS_IAM auth\n/servers · /route · /kv\n/repair · /merkle · /gossip")
         ring_fn = Lambda("ring\nSHA-1 + binary search\nup / down")
-        kv_fn = Lambda("kv coordinator\nN replicas · W/R quorum\nMerkle repair")
-        schedule = Eventbridge("Scheduled rule\nbackground repair")
+        kv_fn = Lambda("kv coordinator\nN replicas · W/R quorum\nMerkle repair · gossip detection")
+        repair_schedule = Eventbridge("Repair rule\nbackground repair")
+        gossip_schedule = Eventbridge("Gossip rule\nfailure-detection tick")
         ring_table = Dynamodb("Ring table\nservers + vnodes + status")
         data_table = Dynamodb("Data table\none item per replica")
 
     client >> Edge(style="dashed", label="attached") >> policy
     client >> Edge(label="HTTPS") >> api
     api >> Edge(label="/servers · /route") >> ring_fn >> Edge(label="Query / BatchWrite") >> ring_table
-    api >> Edge(label="/kv · /repair · /merkle") >> kv_fn
-    schedule >> Edge(label="scheduled-repair") >> kv_fn
-    kv_fn >> Edge(style="dashed", label="Query ring") >> ring_table
+    api >> Edge(label="/kv · /repair · /merkle · /gossip") >> kv_fn
+    repair_schedule >> Edge(label="scheduled-repair") >> kv_fn
+    gossip_schedule >> Edge(label="gossip-tick") >> kv_fn
+    kv_fn >> Edge(style="dashed", label="Query ring · heartbeat · status") >> ring_table
     kv_fn >> Edge(label="parallel Get / Put · Query") >> data_table
