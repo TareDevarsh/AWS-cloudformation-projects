@@ -15,7 +15,7 @@ Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) 
 | 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
 | 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket, leaky bucket (SQS queue), sliding window log and fixed window counter (Redis), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
-| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Phase 1, concepts: the rehashing problem with `hash % n`, the hash ring, lookups, adding and removing servers | To be decided | ⚪ Planned |
+| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Hash ring with virtual nodes: route keys to servers, preference lists, affected ranges on add/remove. Design docs cover a Dynamo-style KV store | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 
@@ -26,7 +26,7 @@ Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 </tr>
 <tr>
 <td width="50%" align="center"><a href="03-rate-limiter/"><img src="03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="03-rate-limiter/">03 · Rate Limiter</a></b></td>
-<td width="50%" align="center"><a href="04-consistent-hashing/"><img src="04-consistent-hashing/docs/images/ring_lookup.png" alt="04 Consistent Hashing ring lookup"/></a><br/><b><a href="04-consistent-hashing/">04 · Consistent Hashing</a></b></td>
+<td width="50%" align="center"><a href="04-consistent-hashing/"><img src="04-consistent-hashing/docs/images/architecture.png" alt="04 Consistent Hashing architecture"/></a><br/><b><a href="04-consistent-hashing/">04 · Consistent Hashing</a></b></td>
 </tr>
 </table>
 
@@ -51,7 +51,10 @@ Every entry below is a link, so you can jump straight to the file.
     - Algorithms: [Token bucket](03-rate-limiter/docs/token_bucket/README.md) · [Leaky bucket](03-rate-limiter/docs/leaky_bucket/README.md) · [Sliding window log](03-rate-limiter/docs/sliding_window_log/README.md) · [Fixed window counter](03-rate-limiter/docs/fixed_window_counter/README.md)
     - [Live tests](03-rate-limiter/tests/integration/)
   - 📦 **[04 · Consistent Hashing](04-consistent-hashing/)**
-    - [Architecture: concepts, sections 1-8](04-consistent-hashing/docs/architecture.md) · [Diagram script](04-consistent-hashing/docs/diagram.py)
+    - [Concepts, sections 1-8](04-consistent-hashing/docs/architecture.md) · [Workflows](04-consistent-hashing/docs/workflow.md)
+    - KV store design: [Partitioning](04-consistent-hashing/docs/kv-1-partitioning.md) · [Replication](04-consistent-hashing/docs/kv-2-replication-consistency.md) · [Failures](04-consistent-hashing/docs/kv-3-failure-handling.md) · [System](04-consistent-hashing/docs/kv-4-system-architecture.md)
+    - [Template](04-consistent-hashing/infrastructure/template.yaml) · [Code: ring handler](04-consistent-hashing/src/ring/handler.py) · [Scripts](04-consistent-hashing/scripts/)
+    - [Integration test](04-consistent-hashing/tests/integration/test_api.py)
 
 ```mermaid
 mindmap
@@ -68,6 +71,8 @@ mindmap
       Rehashing problem
       Hash ring
       Add / remove servers
+      Virtual nodes · DynamoDB
+      Routing API · preference list
 ```
 
 ## How each project is built
@@ -111,8 +116,12 @@ aws-projects/
 │   ├── tests/integration/       ← latency.py, leaky_latency.py, window_latency.py
 │   └── scripts/                 ← deploy.sh, destroy.sh
 ├── 04-consistent-hashing/
-│   ├── README.md                ← phase 1: concepts only
-│   └── docs/                    ← architecture.md, diagram.py, images/
+│   ├── README.md                ← summary, ring API, design-doc index
+│   ├── docs/                    ← architecture.md, kv-1…kv-4, workflow.md, diagram*.py, images/
+│   ├── infrastructure/          ← template.yaml
+│   ├── src/                     ← ring/handler.py
+│   ├── tests/integration/       ← test_api.py
+│   └── scripts/                 ← deploy.sh, destroy.sh
 ├── docs/
 │   └── CONVENTIONS.md           ← folder rules, README order, diagram + security standards
 ├── _template/                   ← project skeleton with {{NN}} {{slug}} {{Title}} placeholders
@@ -150,7 +159,10 @@ graph TD
     A3 --> I3[infrastructure/template.yaml]
     W3 --> S3[scripts + tests]
     R --> P4[04 README]
-    P4 --> A4[architecture.md]
+    P4 --> A4[architecture.md] & W4[workflow.md]
+    P4 --> KV[kv-1 … kv-4 design docs]
+    A4 --> I4[infrastructure/template.yaml]
+    W4 --> S4[scripts + tests]
 ```
 
 ## Reading guide (for reviewers)

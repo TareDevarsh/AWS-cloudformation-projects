@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  04-consistent-hashing - Hash ring with virtual nodes.
+  API Gateway (REST, IAM auth) -> Lambda (Python) -> DynamoDB ring table (on-demand).
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Deployment stage, used in names and tags.
+
+Resources:
+  # ---------- Data ----------
+  # One partition per ring (pk = RING#default). Sort keys:
+  #   SERVER#<serverId>      -> serverId, vnodeCount
+  #   VNODE#<40-hex SHA-1>   -> serverId, vnodeIndex (sorted by position, so a Query returns the ring in order)
+  RingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete            # prototype; switch to Retain for real data
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # ---------- Compute ----------
+  RingFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/consistent-hashing-ring-${Stage}
+      RetentionInDays: 14
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  RingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ring-table-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt RingTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt RingFunctionLogGroup.Arn
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  RingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RingFunctionLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # local Code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub consistent-hashing-ring-${Stage}
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt RingFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RingTable
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+      # Local path; `aws cloudformation package` zips it and uploads to S3.
+      Code: ../src/ring/
+
+  # ---------- API ----------
+  RingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub consistent-hashing-${Stage}
+      Description: Consistent hashing ring API (IAM/SigV4 auth)
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  ServersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: servers
+
+  ServerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref ServersResource
+      PathPart: "{serverId}"
+
+  RouteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: route
+
+  RouteKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref RouteResource
+      PathPart: "{key}"
+
+  AddServerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref ServersResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  ListServersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref ServersResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  RemoveServerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref ServerIdResource
+      HttpMethod: DELETE
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  RouteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref RouteKeyResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+
+  RingApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod]
+    Properties:
+      RestApiId: !Ref RingApi
+
+  RingApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RingApi
+      DeploymentId: !Ref RingApiDeployment
+      StageName: !Ref Stage
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      Tags:
+        - { Key: Project, Value: 04-consistent-hashing }
+        - { Key: Stage, Value: !Ref Stage }
+
+  RingFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RingApi}/*/*/*
+
+  # ---------- Client access ----------
+  RingClientPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to a user/role that should call the consistent hashing API.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: execute-api:Invoke
+            Resource: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RingApi}/${Stage}/*/*
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the ring API
+    Value: !Sub https://${RingApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  TableName:
+    Description: DynamoDB table holding servers and virtual nodes
+    Value: !Ref RingTable
+  FunctionName:
+    Value: !Ref RingFunction
+  ClientPolicyArn:
+    Description: Attach this managed policy to callers to grant execute-api:Invoke
+    Value: !Ref RingClientPolicy

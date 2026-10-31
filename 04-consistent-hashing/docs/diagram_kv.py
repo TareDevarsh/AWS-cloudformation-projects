@@ -1,14 +1,14 @@
 """Render the phase 2 diagrams: a key-value store built on consistent hashing.
     pip install matplotlib
     python3 docs/diagram_kv.py   # writes docs/images/kv_*.png and prints example numbers
-Reuses the style, colours and ring positions of diagram.py (s0..s3, k0..k3).
+Reuses the style, colours and ring positions of diagram_ring.py (s0..s3, k0..k3).
 Ring positions are illustrative angles, not real SHA-1 values. The virtual node
 load chart and the Merkle tree hashes are real SHA-1 calculations.
 """
 import hashlib
 import statistics
 
-from diagram import (SERVERS, KEYS, NEW_SERVER, REMOVED_SERVER, S_COLOR, K_COLOR, HI_COLOR, NEW_COLOR,
+from diagram_ring import (SERVERS, KEYS, NEW_SERVER, REMOVED_SERVER, S_COLOR, K_COLOR, HI_COLOR, NEW_COLOR,
                      plt, FancyArrowPatch, xy, owner, ring_axes, draw_nodes, draw_lookup, save)
 
 GREY = "#999"
