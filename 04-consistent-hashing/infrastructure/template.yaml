@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   04-consistent-hashing - Hash ring with virtual nodes plus a quorum key-value store.
   API Gateway (REST, IAM auth) -> ring Lambda + kv coordinator Lambda (Python)
-  -> DynamoDB ring table + data table (on-demand). N replicas, W/R quorum.
+  -> DynamoDB ring table + data table (on-demand). N replicas, W/R quorum,
+  vector-clock versioning, sloppy quorum + hinted handoff for temporary failures.
 
 Parameters:
   Stage:
@@ -36,6 +37,18 @@ Parameters:
     Description: >
       Vector-clock threshold. When a clock exceeds this many server entries, the oldest
       (by updatedAt) are dropped, which can cause inaccurate reconciliation (false conflicts).
+  HintScanLimit:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 5000
+    Description: Max stand-in items scanned per hinted-handoff replay call (bounds the work).
+  HintReplayLimit:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: Max hints handed off per replay call (bounds the work; `more` flags a remainder).
 
 Resources:
   # ---------- Data ----------
@@ -187,13 +200,16 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow           # read the ring and server status only
-                Action: dynamodb:Query
+              - Effect: Allow           # read the ring and server status; mark a server up on /up
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
                 Resource: !GetAtt RingTable.Arn
-              - Effect: Allow           # replica reads and writes
+              - Effect: Allow           # replica reads and writes; Scan finds stand-in items with hints
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
+                  - dynamodb:Scan
                 Resource: !GetAtt DataTable.Arn
               - Effect: Allow
                 Action:
@@ -226,6 +242,8 @@ Resources:
           QUORUM_W: !Ref W
           QUORUM_R: !Ref R
           MAX_CLOCK_ENTRIES: !Ref MaxClockEntries
+          HINT_SCAN_LIMIT: !Ref HintScanLimit
+          HINT_REPLAY_LIMIT: !Ref HintReplayLimit
       Tags:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }
@@ -284,6 +302,20 @@ Resources:
       RestApiId: !Ref RingApi
       ParentId: !Ref KvResource
       PathPart: "{key}"
+
+  HintsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !GetAtt RingApi.RootResourceId
+      PathPart: hints
+
+  HintsReplayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RingApi
+      ParentId: !Ref HintsResource
+      PathPart: replay
 
   RouteResource:
     Type: AWS::ApiGateway::Resource
@@ -359,6 +391,7 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
 
+  # /up is served by the kv Lambda: marking a server up also replays hinted-handoff writes to it.
   ServerUpMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -369,7 +402,7 @@ Resources:
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
-        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RingFunction.Arn}/invocations
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
 
   PutKeyMethod:
     Type: AWS::ApiGateway::Method
@@ -395,12 +428,25 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
 
-  # Renamed from RingApiDeployment: a new logical ID makes CloudFormation create a fresh
-  # deployment so the step-2 methods go live on stacks that already ran step 1.
-  RingApiDeploymentV2:
+  HintsReplayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RingApi
+      ResourceId: !Ref HintsReplayResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${KvFunction.Arn}/invocations
+
+  # A new logical ID each time methods change makes CloudFormation create a fresh deployment so the
+  # new routes go live on stacks that already ran an earlier step. V3 adds /hints/replay and
+  # repoints /servers/{id}/up to the kv Lambda (hinted-handoff replay).
+  RingApiDeploymentV3:
     Type: AWS::ApiGateway::Deployment
     DependsOn: [AddServerMethod, ListServersMethod, RemoveServerMethod, RouteMethod,
-                ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod]
+                ServerDownMethod, ServerUpMethod, PutKeyMethod, GetKeyMethod, HintsReplayMethod]
     Properties:
       RestApiId: !Ref RingApi
 
@@ -408,7 +454,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RingApi
-      DeploymentId: !Ref RingApiDeploymentV2
+      DeploymentId: !Ref RingApiDeploymentV3
       StageName: !Ref Stage
       MethodSettings:
         - ResourcePath: "/*"

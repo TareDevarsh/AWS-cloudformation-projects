@@ -15,7 +15,7 @@ Every project is a numbered folder at the top of this repo (`01-…`, `02-…`) 
 | 01 | [**Key-Value Store**](01-key-value-store/) | Serverless CRUD API over a NoSQL table, IAM-authenticated | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 | 02 | [**Ad Creative Scorer**](02-ad-creative-scorer/) | ML pipeline: upload an ad image → computer-vision features → CTR score | API Gateway · Lambda · Step Functions · Rekognition · SageMaker · DynamoDB · S3 · KMS · CloudWatch | 🟡 Prototype |
 | 03 | [**Rate Limiter**](03-rate-limiter/) | Rate limiter middleware in front of a Lambda backend: token bucket, leaky bucket (SQS queue), sliding window log and fixed window counter (Redis), compared in Python, Go and Node | EC2 · Docker · Redis · S3 · SQS · Lambda | 🟡 Prototype |
-| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Hash ring with virtual nodes plus a quorum KV store: N replicas, W/R quorum reads and writes, vector clocks with conflict detection and server-side last-write-wins, simulated server failure, affected ranges on add/remove. Design docs cover a Dynamo-style KV store | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
+| 04 | [**Consistent Hashing**](04-consistent-hashing/) | Hash ring with virtual nodes plus a quorum KV store: N replicas, W/R quorum reads and writes, vector clocks with conflict detection and server-side last-write-wins, sloppy quorum with hinted handoff on temporary failures, affected ranges on add/remove. Design docs cover a Dynamo-style KV store | API Gateway · Lambda · DynamoDB · IAM · CloudWatch | 🟡 Prototype |
 
 Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 

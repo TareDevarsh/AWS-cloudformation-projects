@@ -1,7 +1,7 @@
 # Workflow · 04 Consistent Hashing
 [← Project README](../README.md)
 
-Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Data is not moved when the ring changes.
+Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Step 4 makes the quorum **sloppy**: when a primary replica is down the coordinator walks the ring to a healthy **stand-in** for both writes and reads, a stand-in write records a **hint** (`hintFor`) naming the down primary, and when the primary returns (`/up`, or `POST /hints/replay`) the hint is replayed to it and cleared (**hinted handoff**). Data is not moved when the ring changes.
 
 ## Data model
 Two DynamoDB tables. The ring table has one partition per ring (`pk = RING#default`). Vnode sort keys are the zero-padded 40-hex-digit SHA-1 position, so a `Query` on `begins_with(sk, "VNODE#")` returns the ring already sorted clockwise.
@@ -28,6 +28,7 @@ erDiagram
         string itemKey "sort key: the user key"
         number rev "revision for the conditional write (optimistic lock)"
         string versions "JSON list of siblings {value, clock, timestamp, coordinator}, value up to 10 KB"
+        string hintFor "stand-in only: JSON list of down primaries this copy is held for (absent on a normal replica)"
     }
 ```
 
@@ -184,9 +185,92 @@ sequenceDiagram
 
 A later PUT carrying the merged `context` supersedes all of the siblings, so the next GET sees a single version. The trade-off of `W + R <= N` still holds: with `?r=1` only the first replica is counted and a sibling held elsewhere is missed.
 
+## Sloppy write to a stand-in (step 4)
+
+Primary `Sb` is down. The coordinator walks the ring to the next healthy distinct server, `Sx`, and uses it as a stand-in for `Sb`. `Sx` stores the value plus `hintFor = [Sb]`. W=2 is still met without the down primary.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant K as kv Lambda
+    participant RT as Ring table
+    participant Sa as Sa (primary, up)
+    participant Sx as Sx (stand-in for Sb)
+    C->>K: PUT /kv/{key} {value} (SigV4)
+    K->>RT: Query ring + server status
+    K->>K: preference list [Sa, Sb, Sc]; Sb is down
+    K->>K: walk ring: next healthy distinct server = Sx -> stand-in for Sb
+    Note over K: targets = Sa (primary), Sx (stand-in for Sb), Sc (primary)
+    par write the sloppy target set (conditional on rev)
+        K->>Sa: merge version
+    and
+        K->>Sx: merge version + add Sb to hintFor
+    end
+    Note over Sx: stand-in item carries hintFor = [Sb]
+    alt acks >= w
+        K-->>C: 200 {acked:[{Sa}, {Sx, standIn, primary:Sb}, {Sc}]}
+    else too few healthy targets
+        K-->>C: 503 write not attempted
+    end
+```
+
+## Sloppy read during an outage (step 4)
+
+While `Sb` is still down, a GET walks to the same stand-in `Sx`, so it sees the value written there — the window a strict read (primaries only) would miss. Versions from primaries and stand-ins are unioned and reconciled exactly as step 3.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant K as kv Lambda
+    participant RT as Ring table
+    participant Sa as Sa (primary, up)
+    participant Sx as Sx (stand-in for Sb)
+    C->>K: GET /kv/{key}?r=2 (SigV4)
+    K->>RT: Query ring + server status (Sb still down)
+    K->>K: targets = Sa (primary), Sx (stand-in for Sb), Sc (primary)
+    par read the first r targets
+        K->>Sa: GetItem
+        Sa-->>K: version(s)
+    and
+        K->>Sx: GetItem
+        Sx-->>K: version (written during the outage)
+    end
+    K->>K: union versions (primaries + stand-ins), drop dominated, LWW if >1
+    Note over K: no read repair; each replica row carries role = primary | standIn (standInFor)
+    K-->>C: 200 {value, replicas:[{Sa, role:primary}, {Sx, role:standIn, standInFor:Sb}, …]}
+```
+
+## Hint replay on recovery (step 4)
+
+`Sb` comes back. `POST /servers/{id}/up` is served by the **kv** Lambda (it needs data-table access): it marks `Sb` up, scans for stand-in items whose `hintFor` lists `Sb`, writes each back to `Sb` with a vector-clock merge, and removes `Sb` from the hint. Replay is idempotent and bounded.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant K as kv Lambda
+    participant RT as Ring table
+    participant D as Data table
+    participant Sb as Sb (recovered primary)
+    C->>K: POST /servers/Sb/up (SigV4)
+    K->>RT: UpdateItem SET status = up (condition attribute_exists, else 404)
+    K->>D: Scan for items with attribute_exists(hintFor)  (bounded by HintScanLimit)
+    D-->>K: stand-in items, e.g. Sx holds {key, hintFor:[Sb]}
+    loop each hint destined for an up server (bounded by HintReplayLimit)
+        K->>Sb: merge the stand-in's versions into the real primary (conditional on rev)
+        K->>D: remove Sb from that item's hintFor (drop attribute when empty)
+    end
+    Note over K,D: idempotent — a second /up or /hints/replay finds no matching hint and hands off 0
+    K-->>C: 200 {status:up, hintReplay:{hintsReplayed, keysReplayed, byServer, more}}
+```
+
+`POST /hints/replay` (optional body `{serverId}`) runs the same scan-and-hand-off on demand; without a `serverId` it replays every hint whose intended primary is up. It returns `409` if a named server is not up.
+
 ## Simulated failure
 
-`POST /servers/{id}/down` runs `UpdateItem SET status = down` (condition `attribute_exists`, else 404) through the ring Lambda; `/up` sets it back. The kv Lambda reads `status` on every request, so the change applies at once.
+`POST /servers/{id}/down` runs `UpdateItem SET status = down` (condition `attribute_exists`, else 404) through the ring Lambda. `POST /servers/{id}/up` is served by the **kv** Lambda instead, because bringing a server up also replays hinted-handoff writes to it (above), which needs data-table access. The kv Lambda reads `status` on every request, so a down/up change applies at once.
 
 ## Deploy lifecycle
 ```mermaid
@@ -230,3 +314,11 @@ stateDiagram-v2
 | 19 | D5 at Sx with the GET context, then `GET` | no conflict, clock has Sx, Sy, Sz with `Sx:3` |
 | 20 | Two context-less `PUT`s at different coordinators | conflict detected |
 | 21 | `PUT ?coordinator=` not in the preference list | 400 |
+| 22 | One primary down, `PUT` a fresh key, W=2 | 200, acked via a stand-in (`standIn` true) |
+| 23 | `GET` during the outage | 200, returns the fresh value from the stand-in |
+| 24 | Same `GET` | a replica row has `role` standIn with `standInFor` = the down primary |
+| 25 | `POST /servers/{id}/up` on the recovered primary | 200, `hintReplay.hintsReplayed` ≥ 1 |
+| 26 | `GET` after `/up` | value now on the original primary (its row `found`, `role` primary) |
+| 27 | `POST /hints/replay` run twice | second pass hands off this key's hint 0 times (idempotent) |
+| 28 | `GET` after repeated replay | value unchanged, no conflict |
+| 29 | `POST /hints/replay` for a server that is down | 409 |

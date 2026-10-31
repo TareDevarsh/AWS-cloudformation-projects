@@ -5,8 +5,10 @@ Routes (API Gateway REST, AWS_PROXY integration):
     GET    /servers                  list servers, status, vnode counts and share of the ring
     DELETE /servers/{serverId}       remove a server + its virtual nodes
     POST   /servers/{serverId}/down  mark a server down (simulated failure; kv reads/writes skip it)
-    POST   /servers/{serverId}/up    mark a server up again
     GET    /route/{key}[?n=3]        owning vnode/server; n = preference list of N distinct servers
+
+The matching `/servers/{serverId}/up` route is served by the kv Lambda: bringing a server up also
+replays hints destined for it (hinted handoff, step 4), which needs data-table access.
 
 Ring math lives in ring_math.py (src/shared/, copied in by scripts/deploy.sh).
 A vnode owns the range (previous vnode, this vnode].
@@ -117,7 +119,10 @@ def list_servers():
 
 
 def set_status(server_id, status):
-    """Simulated failure: the kv coordinator treats a down server as a failed replica."""
+    """Simulated failure: the kv coordinator treats a down server as a failed replica (walks past it).
+
+    Only `down` is set here; `/up` is handled by the kv Lambda so it can also replay hints.
+    """
     if not SERVER_ID_RE.match(server_id or ""):
         return resp(400, {"error": "invalid serverId"})
     try:
@@ -166,8 +171,6 @@ def handler(event, context):
         return remove_server(params.get("serverId"))
     if resource == "/servers/{serverId}/down" and method == "POST":
         return set_status(params.get("serverId"), "down")
-    if resource == "/servers/{serverId}/up" and method == "POST":
-        return set_status(params.get("serverId"), "up")
     if resource == "/route/{key}" and method == "GET":
         return route(params.get("key"), event.get("queryStringParameters") or {})
     return resp(405, {"error": "method not allowed"})

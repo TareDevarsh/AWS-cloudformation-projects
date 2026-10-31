@@ -8,6 +8,8 @@ Uses server ids prefixed "it-" and removes them at the end.
 The quorum checks assume the default N=3, W=2, R=2 and a fresh key per run.
 The conflict checks (step 3) replay the docs' D1..D5 vector-clock example through the API
 using ?coordinator=, and assume N=3 with the 3 remaining test servers up.
+The sloppy checks (step 4) take a primary down, write/read via a stand-in, then replay the hint
+on /up; they rely on a spare server (4 test servers, N=3) so a stand-in is available.
 """
 import sys
 import time
@@ -150,6 +152,77 @@ def conflict_checks(base):
     return results
 
 
+def sloppy_checks(base):
+    """Step 4: sloppy quorum + hinted handoff. N=3, W=2, R=2, 3 test servers up (one spare of 4).
+
+    Take one primary down, PUT via a stand-in, sloppy GET reads it during the outage, then /up
+    replays the hint to the primary and clears it; /hints/replay run twice is idempotent.
+    """
+    results = []
+    key = f"it-sloppy-{int(time.time())}"
+    url = f"{base}/kv/{key}"
+
+    status, b = call("GET", f"{base}/route/{key}?n=3")
+    pref = b.get("preferenceList", [])
+    if len(pref) < 3:
+        return [check("sloppy: preference list has 3 servers", False, str(pref))]
+    down = pref[0]
+
+    call("POST", f"{base}/servers/{down}/down")
+    # Write while the first primary is down: W=2 reached via a stand-in, which records a hint.
+    status, b = call("PUT", url, {"value": "sloppy-v1"})
+    acked = b.get("acked", [])
+    standins = [a for a in acked if a.get("standIn")]
+    results.append(check("sloppy PUT with a primary down -> 200 via stand-in",
+                         status == 200 and len(acked) >= 2 and bool(standins),
+                         f"status {status} acked {[a.get('serverId') for a in acked]}"))
+
+    # Sloppy GET reaches the stand-in while the primary is still down.
+    status, g = call("GET", url)
+    standin_responders = [rr for rr in g.get("replicas", [])
+                          if rr.get("role") == "standIn" and rr.get("standInFor") == down]
+    results.append(check("sloppy GET returns the fresh value during the outage",
+                         status == 200 and g.get("value") == "sloppy-v1", f"value {g.get('value')}"))
+    results.append(check("sloppy GET shows a stand-in responder for the down primary",
+                         bool(standin_responders),
+                         f"roles {[(rr.get('serverId'), rr.get('role'), rr.get('standInFor')) for rr in g.get('replicas', [])]}"))
+
+    # Bring the primary up: /up replays the hint to it and clears the hint.
+    status, u = call("POST", f"{base}/servers/{down}/up")
+    replay = u.get("hintReplay", {})
+    results.append(check("/up replays the hint to the recovered primary",
+                         status == 200 and replay.get("hintsReplayed", 0) >= 1, f"replay {replay}"))
+
+    # Per-replica details now show the value on the original primary (it is a primary again, found).
+    status, g2 = call("GET", url)
+    primary_row = next((rr for rr in g2.get("replicas", [])
+                        if rr.get("serverId") == down and rr.get("role") == "primary"), None)
+    results.append(check("value now lives on the recovered primary",
+                         status == 200 and primary_row is not None and primary_row.get("found")
+                         and g2.get("value") == "sloppy-v1",
+                         f"primary row {primary_row}"))
+
+    # /hints/replay run twice is idempotent: the hint is gone, so no further hand-offs, value intact.
+    status, h1 = call("POST", f"{base}/hints/replay")
+    status, h2 = call("POST", f"{base}/hints/replay")
+    results.append(check("/hints/replay is idempotent (second pass replays this key's hint 0 times)",
+                         h2.get("hintReplay", {}).get("hintsReplayed", 0) == 0,
+                         f"first {h1.get('hintReplay')} second {h2.get('hintReplay')}"))
+    status, g3 = call("GET", url)
+    results.append(check("value unchanged after repeated replay",
+                         status == 200 and g3.get("value") == "sloppy-v1" and not g3.get("conflict", {}).get("detected"),
+                         f"value {g3.get('value')}"))
+
+    # Replaying hints for a server that is down is rejected.
+    status, _ = call("POST", f"{base}/hints/replay", {"serverId": down})
+    down2 = pref[1]
+    call("POST", f"{base}/servers/{down2}/down")
+    status, _ = call("POST", f"{base}/hints/replay", {"serverId": down2})
+    results.append(check("replay for a down server -> 409", status == 409, f"status {status}"))
+    call("POST", f"{base}/servers/{down2}/up")
+    return results
+
+
 def main():
     base = stack_output(f"consistent-hashing-{STAGE}", "ApiEndpoint")
     print(f"Endpoint: {base}\n")
@@ -184,6 +257,7 @@ def main():
 
     results += quorum_checks(base)
     results += conflict_checks(base)
+    results += sloppy_checks(base)
 
     for s in SERVERS[0:1] + SERVERS[2:]:
         call("DELETE", f"{base}/servers/{s}")
