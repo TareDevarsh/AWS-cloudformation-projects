@@ -1,7 +1,7 @@
 # Workflow · 04 Consistent Hashing
 [← Project README](../README.md)
 
-Step 1 built the hash ring with virtual nodes and a routing API. Step 2 adds a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Data is not moved when the ring changes.
+Step 1 built the hash ring with virtual nodes and a routing API. Step 2 added a kv coordinator Lambda that stores each key on N replicas with quorum writes (W) and reads (R), plus up/down switches that simulate server failure. Step 3 replaces the integer version with a **vector clock**: a coordinator stamps each write, replicas keep concurrent siblings, and a read detects conflicts and resolves them server-side with last-write-wins. Data is not moved when the ring changes.
 
 ## Data model
 Two DynamoDB tables. The ring table has one partition per ring (`pk = RING#default`). Vnode sort keys are the zero-padded 40-hex-digit SHA-1 position, so a `Query` on `begins_with(sk, "VNODE#")` returns the ring already sorted clockwise.
@@ -26,13 +26,12 @@ erDiagram
     REPLICA {
         string serverId "partition key (data table)"
         string itemKey "sort key: the user key"
-        string value "up to 10 KB"
-        number version "integer counter, highest wins"
-        string updatedAt "ISO-8601 UTC"
+        number rev "revision for the conditional write (optimistic lock)"
+        string versions "JSON list of siblings {value, clock, timestamp, coordinator}, value up to 10 KB"
     }
 ```
 
-The data table holds one item per replica: the same key on 3 servers is 3 items, `(s2, user-42)`, `(s0, user-42)`, `(s3, user-42)`. Each server gets its own partition, like one node's local storage. Ring math (`src/shared/ring_math.py`) is copied into both functions at package time.
+The data table holds one item per replica: the same key on 3 servers is 3 items, `(s2, user-42)`, `(s0, user-42)`, `(s3, user-42)`. Each server gets its own partition, like one node's local storage. Each item stores a list of concurrent sibling versions, each with its own vector clock, plus a `rev` that backs an optimistic-concurrency conditional write so two coordinators writing the same replica item do not clobber each other. Ring math (`src/shared/ring_math.py`) and vector-clock ops (`src/shared/vector_clock.py`) are copied into the functions at package time.
 
 ## Route a key
 ```mermaid
@@ -82,9 +81,9 @@ sequenceDiagram
 
 Removing a server (`DELETE /servers/{serverId}`) is the reverse: load the ring, delete that server's vnodes and its `SERVER#` item, and return each range with `fromServer` (the removed one) and `toServer` (the next vnode clockwise).
 
-## Quorum write (PUT)
+## Quorum write (PUT) with a vector clock
 
-Defaults N=3, W=2. Here the first replica is marked down, so the write succeeds with 2 of 3 acks.
+Defaults N=3, W=2. The coordinator (first up server, or `?coordinator=`) increments its own clock entry. Each replica merges the new version into its sibling list under a conditional write on `rev`.
 
 ```mermaid
 sequenceDiagram
@@ -94,37 +93,61 @@ sequenceDiagram
     participant K as kv Lambda
     participant RT as Ring table
     participant D as Data table
-    C->>G: PUT /kv/{key}?w=2 {value} (SigV4)
+    C->>G: PUT /kv/{key}?w=2 {value, context} (SigV4)
     G->>K: invoke
-    K->>K: validate key, value <= 10 KB, w in 1..N
+    K->>K: validate key, value <= 10 KB, w in 1..N, decode context
     K->>RT: Query pk=RING#default (vnodes + server status)
-    K->>K: preference list = first N distinct servers clockwise from SHA-1(key)
-    Note over K: s2 is down: counted as failed, not called
-    alt up replicas < w
-        K-->>C: 503 write not attempted, failed list
-    else enough replicas up
-        par read-before-write
-            K->>D: GetItem (s0, key)
+    K->>K: preference list; pick coordinator (default first up, or ?coordinator=)
+    alt coordinator not in preference list
+        K-->>C: 400
+    else coordinator down or up replicas < w
+        K-->>C: 503 write not attempted
+    else
+        K->>K: new clock = context clock + increment(coordinator), truncate to MaxClockEntries
+        par write every up replica (conditional on rev, bounded retry)
+            K->>D: GetItem (s0, key); merge new version; PutItem if rev unchanged
         and
-            K->>D: GetItem (s3, key)
+            K->>D: GetItem (s3, key); merge new version; PutItem if rev unchanged
         end
-        K->>K: version = highest version seen + 1
-        par write replicas
-            K->>D: PutItem (s0, key, value, version, updatedAt)
-        and
-            K->>D: PutItem (s3, key, value, version, updatedAt)
-        end
+        Note over D: replica drops versions the new clock supersedes,<br/>keeps concurrent siblings, ignores a write it already descends from
         alt acks >= w
-            K-->>C: 200 {preferenceList, acked [s0, s3], failed [s2 down], version, n, w}
+            K-->>C: 200 {coordinator, clock, context, acked, failed}
         else acks < w
             K-->>C: 503 {acked, failed}
         end
     end
 ```
 
-## Quorum read (GET)
+## Conflicting write pair
 
-Defaults R=2. s2 is back up but missed the last write, so it holds an older version.
+Two clients update the same base version through different coordinators (`Sy` and `Sz`), with no ordering between them. Each replica keeps both as siblings.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Client A
+    participant B as Client B
+    participant Ky as kv (coordinator Sy)
+    participant Kz as kv (coordinator Sz)
+    participant D as Data table
+    Note over A,B: both start from D2 context = ([Sx,2])
+    A->>Ky: PUT {value D3, context ([Sx,2])} ?coordinator=Sy
+    B->>Kz: PUT {value D4, context ([Sx,2])} ?coordinator=Sz
+    Ky->>Ky: clock = ([Sx,2],[Sy,1])
+    Kz->>Kz: clock = ([Sx,2],[Sz,1])
+    par
+        Ky->>D: merge D3 into each replica (concurrent with D4)
+    and
+        Kz->>D: merge D4 into each replica (concurrent with D3)
+    end
+    Note over D: neither clock descends from the other,<br/>so each replica stores D3 and D4 as siblings
+    Ky-->>A: 200 clock ([Sx,2],[Sy,1])
+    Kz-->>B: 200 clock ([Sx,2],[Sz,1])
+```
+
+## Quorum read (GET) with server-side LWW
+
+Defaults R=2. The coordinator unions versions from the counted replicas, drops dominated ones, and if more than one concurrent version remains resolves it by last-write-wins (highest timestamp, tiebreak highest coordinator serverId). The resolution is not written back.
 
 ```mermaid
 sequenceDiagram
@@ -137,29 +160,29 @@ sequenceDiagram
     C->>G: GET /kv/{key}?r=2 (SigV4)
     G->>K: invoke
     K->>RT: Query ring + server status
-    K->>K: preference list [s2, s0, s3], drop down servers
+    K->>K: preference list, drop down servers
     par read every up replica
-        K->>D: GetItem (s2, key)
-        D-->>K: v1 (stale)
+        K->>D: GetItem (Sx, key)
+        D-->>K: [D3, D4] siblings
     and
-        K->>D: GetItem (s0, key)
-        D-->>K: v2
-    and
-        K->>D: GetItem (s3, key)
-        D-->>K: v2
+        K->>D: GetItem (Sy, key)
+        D-->>K: [D3, D4] siblings
     end
-    K->>K: count first r responses in preference-list order (s2, s0)
+    K->>K: union versions from first r replicas, drop dominated
     alt fewer than r responses
         K-->>C: 503 {replicas}
-    else none of the counted replicas has the key
+    else no surviving version
         K-->>C: 404 {replicas}
-    else
-        K->>K: winner = highest version among counted (v2 from s0)
-        K-->>C: 200 {value v2, version 2, staleReplicas [s2], replicas [...]}
+    else one survivor
+        K-->>C: 200 {value, context, conflict.detected=false}
+    else more than one concurrent survivor
+        K->>K: conflict detected; winner = max(timestamp, coordinator id)
+        Note over K: LWW can silently drop the other write; not written back (no read repair)
+        K-->>C: 200 {value=winner, context=merged clock, conflict {detected, versions, winner, discarded}}
     end
 ```
 
-With `?r=1` only s2 is counted, so the client gets the stale v1. That is the trade-off of `W + R <= N`: here W=2, R=1, N=3.
+A later PUT carrying the merged `context` supersedes all of the siblings, so the next GET sees a single version. The trade-off of `W + R <= N` still holds: with `?r=1` only the first replica is counted and a sibling held elsewhere is missed.
 
 ## Simulated failure
 
@@ -169,10 +192,10 @@ With `?r=1` only s2 is counted, so the client gets the stale v1. That is the tra
 ```mermaid
 stateDiagram-v2
     [*] --> Staging: ./scripts/deploy.sh
-    Staging --> Lint: src/shared copied into each function
+    Staging --> Lint: src/shared/*.py copied into each function (ring_math + vector_clock)
     Lint --> Packaging: cfn-lint ok
     Lint --> [*]: errors
-    Packaging --> Deploying: build/stage/src/{ring,kv} (handler + ring_math.py) uploaded
+    Packaging --> Deploying: build/stage/src/{ring,kv} (handler + shared modules) uploaded
     Deploying --> Deployed: CREATE/UPDATE_COMPLETE
     Deploying --> RolledBack: failure
     RolledBack --> Lint: fix
@@ -195,9 +218,15 @@ stateDiagram-v2
 | 7 | Remove one server | 200, `vnodesRemoved` = 100 |
 | 8 | Re-route 60 keys | only keys of the removed server moved |
 | 9 | Unsigned `PUT /kv/{key}` | 403 |
-| 10 | `PUT` then `GET` a fresh key | 200, 3 acks, value round-trips |
-| 11 | First replica down, `PUT` with W=2 | 200, version 2, down replica not in `acked` |
+| 10 | `PUT` then `GET` a fresh key | 200, 3 acks, value round-trips, no conflict |
+| 11 | First replica down, `PUT` v2 with v1's context, W=2 | 200, down replica not in `acked` |
 | 12 | Two replicas down, `PUT` with W=2 | 503 |
-| 13 | Both back up, `GET ?r=1` | stale v1 from the replica that missed the write |
-| 14 | `GET ?r=3` | latest v2, `staleReplicas` = that replica |
+| 13 | Both back up, `GET ?r=1` | stale v1 from the replica that missed the write, no conflict |
+| 14 | `GET ?r=3` | reconciles to v2 (descends from v1), no conflict |
 | 15 | `GET ?r=9` | 400 |
+| 16 | D1 at Sx, D2 at Sx with D1's context | 200, clock `Sx:2` |
+| 17 | D3 at Sy, D4 at Sz, both with D2's context | concurrent clocks `([Sx,2],[Sy,1])` and `([Sx,2],[Sz,1])` |
+| 18 | `GET` over D3 and D4 | `conflict.detected`, both versions, LWW `winner` |
+| 19 | D5 at Sx with the GET context, then `GET` | no conflict, clock has Sx, Sy, Sz with `Sx:3` |
+| 20 | Two context-less `PUT`s at different coordinators | conflict detected |
+| 21 | `PUT ?coordinator=` not in the preference list | 400 |

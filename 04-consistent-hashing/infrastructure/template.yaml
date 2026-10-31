@@ -28,6 +28,14 @@ Parameters:
     MinValue: 1
     MaxValue: 10
     Description: Default read quorum (responses needed). Keep R <= N.
+  MaxClockEntries:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 100
+    Description: >
+      Vector-clock threshold. When a clock exceeds this many server entries, the oldest
+      (by updatedAt) are dropped, which can cause inaccurate reconciliation (false conflicts).
 
 Resources:
   # ---------- Data ----------
@@ -58,7 +66,9 @@ Resources:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }
 
-  # One item per replica: serverId (partition) + itemKey (sort) -> value, version, updatedAt.
+  # One item per replica: serverId (partition) + itemKey (sort) -> rev, versions (JSON list of
+  # sibling {value, clock, timestamp}). rev backs an optimistic-concurrency conditional write so
+  # concurrent writers to the same replica item do not clobber each other.
   # A partition per simulated server mirrors one node's local storage.
   DataTable:
     Type: AWS::DynamoDB::Table
@@ -215,6 +225,7 @@ Resources:
           QUORUM_N: !Ref N
           QUORUM_W: !Ref W
           QUORUM_R: !Ref R
+          MAX_CLOCK_ENTRIES: !Ref MaxClockEntries
       Tags:
         - { Key: Project, Value: 04-consistent-hashing }
         - { Key: Stage, Value: !Ref Stage }

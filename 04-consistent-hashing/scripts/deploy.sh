@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lint, package src/, and deploy the stack.
 # Usage: ./scripts/deploy.sh [stage] [region]
-#   QUORUM_N=3 QUORUM_W=2 QUORUM_R=2 ./scripts/deploy.sh dev   # override the N/W/R defaults
+#   QUORUM_N=3 QUORUM_W=2 QUORUM_R=2 MAX_CLOCK_ENTRIES=10 ./scripts/deploy.sh dev   # override defaults
 #   BUILD_ONLY=1 ./scripts/deploy.sh                           # stage build/ only, no AWS calls
 set -euo pipefail
 
@@ -13,8 +13,9 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_TEMPLATE="${DIR}/infrastructure/template.yaml"
 PACKAGED="${DIR}/build/packaged.yaml"
 
-# 0. Stage sources: build/stage mirrors infrastructure/ + src/, and each function folder
-#    gets a copy of src/shared/ring_math.py, so `Code: ../src/<fn>/` zips handler + shared module.
+# 0. Stage sources: build/stage mirrors infrastructure/ + src/, and each function folder gets a
+#    copy of src/shared/*.py (ring_math.py for both; vector_clock.py used by kv), so
+#    `Code: ../src/<fn>/` zips the handler plus its shared modules.
 STAGED="${DIR}/build/stage"
 rm -rf "$STAGED"
 mkdir -p "${STAGED}/infrastructure"
@@ -70,6 +71,7 @@ aws cloudformation deploy \
   --stack-name "$STACK" \
   --template-file "$PACKAGED" \
   --parameter-overrides "Stage=${STAGE}" "N=${QUORUM_N:-3}" "W=${QUORUM_W:-2}" "R=${QUORUM_R:-2}" \
+    "MaxClockEntries=${MAX_CLOCK_ENTRIES:-10}" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
   --tags "Project=${PROJECT}" "Stage=${STAGE}"

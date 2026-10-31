@@ -9,13 +9,14 @@
 ![Architecture](docs/images/architecture.png)
 
 ## Summary
-A consistent hashing ring with virtual nodes, stored in DynamoDB and served by a Lambda behind an IAM-authorized API. You add and remove servers, and the API tells you which server owns any key, which key ranges changed owner, and how much of the ring each server holds. The design docs (concepts, then a Dynamo/Cassandra-style key-value store) explain the theory. Step 1 built the ring and routing. Step 2 adds a key-value store on top: each key is written to N replicas (the first N distinct servers clockwise) with a write quorum W and read quorum R, and you can mark servers down to watch quorums succeed or fail.
+A consistent hashing ring with virtual nodes, stored in DynamoDB and served by a Lambda behind an IAM-authorized API. You add and remove servers, and the API tells you which server owns any key, which key ranges changed owner, and how much of the ring each server holds. The design docs (concepts, then a Dynamo/Cassandra-style key-value store) explain the theory. Step 1 built the ring and routing. Step 2 added a key-value store on top: each key is written to N replicas (the first N distinct servers clockwise) with a write quorum W and read quorum R, and you can mark servers down to watch quorums succeed or fail. Step 3 replaces the integer version with a **vector clock**: writes carry a clock keyed by the coordinating server, a read returns every concurrent sibling plus an opaque `context`, and the coordinator detects conflicts and resolves them server-side with last-write-wins.
 
 | Fact | Value |
 |------|-------|
-| Status | 🟡 Prototype: step 2, quorum reads/writes on N replicas (not deployed yet) |
+| Status | 🟡 Prototype: step 3, vector clocks + server-side LWW conflict resolution (not deployed yet) |
 | AWS services | API Gateway (REST) · Lambda (Python 3.12) · DynamoDB · IAM · CloudWatch Logs |
 | Quorum | N=3, W=2, R=2 by default (stack parameters); per-request `?w=` / `?r=` overrides |
+| Versioning | Vector clock per version; `MaxClockEntries`=10 threshold; server-side LWW on conflict |
 | Auth | IAM / SigV4 on every method, client managed policy output |
 | Infra as code | [`infrastructure/template.yaml`](infrastructure/template.yaml) |
 | Cost at idle | ~$0 (on-demand DynamoDB, pay-per-request Lambda and API Gateway) |
@@ -29,11 +30,11 @@ flowchart LR
     Policy[Client managed policy<br/>execute-api:Invoke] -.attached to.-> Client
     Api -->|/servers · /route| Fn[ring Lambda<br/>SHA-1 + binary search<br/>up / down]
     Fn -->|Query / PutItem / UpdateItem / BatchWriteItem| Table[(DynamoDB ring table<br/>servers + vnodes + status)]
-    Api -->|/kv/key| Kv[kv coordinator Lambda<br/>N replicas, W/R quorum]
+    Api -->|/kv/key| Kv[kv coordinator Lambda<br/>N replicas, W/R quorum<br/>vector clocks + LWW]
     Kv -.->|Query ring + status| Table
-    Kv -->|parallel GetItem / PutItem| Data[(DynamoDB data table<br/>one item per replica)]
-    Shared[src/shared/ring_math.py] -.copied into both by deploy.sh.-> Fn
-    Shared -.-> Kv
+    Kv -->|parallel GetItem / conditional PutItem| Data[(DynamoDB data table<br/>one item per replica<br/>sibling versions + rev)]
+    Shared[src/shared/ring_math.py + vector_clock.py] -.copied into kv by deploy.sh.-> Kv
+    Ring2[src/shared/ring_math.py] -.-> Fn
 ```
 
 ## How it works
@@ -42,10 +43,11 @@ flowchart LR
 3. To route a key, the Lambda hashes it with SHA-1 and binary-searches for the first vnode at or after that position, wrapping to the first vnode. That vnode's server owns the key.
 4. With `?n=3` the Lambda keeps walking clockwise and returns the first 3 distinct physical servers (the preference list from [replication](docs/kv-2-replication-consistency.md#4-data-replication-for-high-availability)), skipping extra vnodes of servers already chosen. The kv coordinator uses the same list to place replicas.
 5. Adding or removing a server diffs the old and new ring and returns every key range `(start, end]` that changed owner, with `fromServer` and `toServer`. These are the [affected keys](docs/kv-1-partitioning.md#3-finding-affected-keys-on-addremove). Stored data is not moved yet.
-6. **Quorum write** (`PUT /kv/{key}`): the coordinator builds the preference list and skips servers marked `down`, which count as failed replicas (strict quorum, no stand-ins). If fewer than W replicas are up it returns 503 without writing. Otherwise it reads the up replicas in parallel, sets `version` = highest version seen + 1, writes all of them in parallel, and returns 200 once at least W acked.
-7. **Quorum read** (`GET /kv/{key}`): the coordinator reads every up replica in parallel, counts the first R responses in preference-list order, and returns the value with the highest version among them. Every replica's response is listed, and `staleReplicas` names those behind the winner, so a replica that missed a write while down is visible. See [quorum consensus](docs/kv-2-replication-consistency.md#5-consistency-and-quorum-n-w-r).
-8. **Simulated failure**: `POST /servers/{id}/down` sets `status = down` on the server item; `/up` reverts it. The data stays in place, so a server that comes back keeps its old versions until the next write reaches it.
-9. If N is larger than the number of servers, all servers are used and the response reports the effective `n`. `w` and `r` overrides must be 1..N.
+6. **Coordinator**: the server that runs the write. By default it is the first up server in the preference list; `?coordinator=<serverId>` overrides it but must be in the preference list (else `400`) and up (else `503`). The coordinator increments its own entry in the [vector clock](docs/kv-2-replication-consistency.md#7-inconsistency-resolution-versioning-and-vector-clocks).
+7. **Quorum write** (`PUT /kv/{key}`): the coordinator skips servers marked `down`, which count as failed replicas (strict quorum, no stand-ins). If fewer than W replicas are up it returns 503 without writing. Otherwise it builds the new clock = the request `context` clock (empty if absent) with the coordinator's entry incremented, then truncated to `MaxClockEntries`. Each replica merges this version into its stored sibling list: it drops stored versions the new clock supersedes, keeps concurrent ones, and ignores the write if a stored version already descends from it, guarded by a conditional write on a `rev` attribute with bounded retry. The response returns the new `clock` and an opaque `context`. A PUT without context can be concurrent with existing data.
+8. **Quorum read** (`GET /kv/{key}`): the coordinator reads every up replica in parallel, counts the first R responses, unions their versions, and drops any version dominated by another. It returns the merged `context` (clock of every version seen, so the next PUT with it supersedes them all). If more than one concurrent version survives, `conflict.detected` is true and the coordinator resolves it **server-side by last-write-wins**: highest `timestamp`, tiebreak by highest coordinator serverId. The response carries the winning `value`, the full `conflict.versions`, the `winner`, and the `discarded` siblings. The resolution is not written back (no read repair); the next PUT with the returned context collapses the siblings. See [vector clocks](docs/kv-2-replication-consistency.md#7-inconsistency-resolution-versioning-and-vector-clocks).
+9. **Simulated failure**: `POST /servers/{id}/down` sets `status = down` on the server item; `/up` reverts it. The data stays in place, so a server that comes back keeps its old versions until the next write reaches it.
+10. If N is larger than the number of servers, all servers are used and the response reports the effective `n`. `w` and `r` overrides must be 1..N.
 
 | Method | Path | Body | Result |
 |--------|------|------|--------|
@@ -55,10 +57,10 @@ flowchart LR
 | `GET` | `/route/{key}[?n=3]` | | `200` key position, owning vnode, `serverId`, optional `preferenceList` · `409` empty ring |
 | `POST` | `/servers/{serverId}/down` | | `200` server marked down (simulated failure) · `404` |
 | `POST` | `/servers/{serverId}/up` | | `200` server marked up · `404` |
-| `PUT` | `/kv/{key}[?w=2]` | `{"value": "..."}` | `200` ≥ W acks: `preferenceList`, `acked`, `failed`, `version`, `n`, `w` · `503` quorum not met · `409` empty ring |
-| `GET` | `/kv/{key}[?r=2]` | | `200` highest-version value + every replica's response, `staleReplicas` · `404` not on the R replicas counted · `503` fewer than R responses |
+| `PUT` | `/kv/{key}[?w=2][&coordinator=s0]` | `{"value": "...", "context": "<opaque>"}` | `200` ≥ W acks: `coordinator`, `clock`, `context`, `acked`, `failed` · `400` bad context / coordinator not in preference list · `503` quorum not met or coordinator down · `409` empty ring |
+| `GET` | `/kv/{key}[?r=2]` | | `200` winning `value`, `context`, `conflict` (`detected`, `versions`, `winner`, `discarded`) + every replica's versions · `404` not on the R replicas counted · `503` fewer than R responses |
 
-Validation: `serverId` is 1-64 chars of `A-Z a-z 0-9 _ . -`; `vnodes` is 1-500; route `key` is 1-256 bytes; `n` is 1-10. KV `key` is 1-256 chars of `A-Z a-z 0-9 _ . : -`; `value` is a string up to 10 KB; `w` and `r` are 1..N.
+Validation: `serverId` is 1-64 chars of `A-Z a-z 0-9 _ . -`; `vnodes` is 1-500; route `key` is 1-256 bytes; `n` is 1-10. KV `key` is 1-256 chars of `A-Z a-z 0-9 _ . : -`; `value` is a string up to 10 KB; `w` and `r` are 1..N; `context` is base64url JSON of a vector clock, decoded size-limited to 4 KB and shape-checked.
 
 More detail and the data model: [docs/workflow.md](docs/workflow.md).
 
@@ -70,14 +72,18 @@ More detail and the data model: [docs/workflow.md](docs/workflow.md).
  "vnode": {"position": "40a7…", "serverId": "s2", "vnodeIndex": 17},
  "preferenceList": ["s2", "s0", "s3"]}
 
-// PUT /kv/user-42 {"value": "v2"}   (s2 marked down)
-{"key": "user-42", "preferenceList": ["s2", "s0", "s3"], "n": 3, "nConfigured": 3, "w": 2,
- "version": 2, "updatedAt": "…", "acked": ["s0", "s3"], "failed": [{"serverId": "s2", "reason": "down"}]}
+// PUT /kv/user-42?coordinator=s2 {"value": "D2", "context": "<from a prior GET>"}
+{"key": "user-42", "preferenceList": ["s2", "s0", "s3"], "coordinator": "s2", "n": 3, "w": 2,
+ "clock": {"s2": {"counter": 2, "updatedAt": "…"}}, "context": "eyJzMiI6…",
+ "acked": ["s2", "s0", "s3"], "failed": []}
 
-// GET /kv/user-42?r=3   (s2 back up, but it missed version 2)
-{"key": "user-42", "value": "v2", "version": 2, "r": 3, "staleReplicas": ["s2"],
- "replicas": [{"serverId": "s2", "status": "ok", "found": true, "value": "v1", "version": 1, "counted": true, …},
-              {"serverId": "s0", "status": "ok", "found": true, "value": "v2", "version": 2, "counted": true, …}, …]}
+// GET /kv/user-42   (two concurrent writes D3 at s0 and D4 at s3 -> conflict, LWW resolves)
+{"key": "user-42", "value": "D4", "context": "eyJzMiI6…",
+ "conflict": {"detected": true,
+   "versions": [{"value": "D3", "clock": {…}, "timestamp": "…", "coordinator": "s0"},
+                {"value": "D4", "clock": {…}, "timestamp": "…", "coordinator": "s3"}],
+   "winner": {"value": "D4", …}, "discarded": [{"value": "D3", …}]},
+ "replicas": [{"serverId": "s2", "status": "ok", "found": true, "versions": [{…}], "counted": true}, …]}
 
 // POST /servers {"serverId": "s4", "vnodes": 100}
 {"serverId": "s4", "vnodesAdded": 100, "affectedRanges": 84,
@@ -87,7 +93,7 @@ More detail and the data model: [docs/workflow.md](docs/workflow.md).
 
 Local check of the ring code (4 servers x 100 vnodes, 10,000 keys): shares were 21-27% per server. Adding a 5th server moved 1,965 keys (19.6%), all to the new server. Removing a server moved only its own 2,173 keys.
 
-Local check of the coordinator (in-memory fake tables, 5 servers, N=3): with 0/1/2 preference-list servers down, W=1 succeeded in all three cases, W=2 succeeded with 0-1 down and returned 503 with 2 down, and W=3 succeeded only with none down. After a write that missed one replica, `R=1` returned the stale value from that replica and `R=3` returned the newest version with the stale replica listed.
+Local check of the coordinator (in-memory fake tables, N=3): replaying the docs' D1..D5 through the handler reproduced the documented clocks exactly — D3 `([Sx,2],[Sy,1])`, D4 `([Sx,2],[Sz,1])` (concurrent siblings), D5 `([Sx,3],[Sy,1],[Sz,1])` after a merge write. A GET over D3 and D4 reported `conflict.detected` with both versions and the LWW winner; the D5 write collapsed them so the next GET showed no conflict. Ancestor/concurrent comparisons, clock truncation at 10 entries (oldest `updatedAt` dropped), the LWW timestamp/coordinator tiebreak, and the step-2 quorum cases (W=2 succeeds with one down, 503 with two down, invalid/down coordinator rejected) all passed.
 
 ## Design docs
 <details><summary>Concepts and key-value store design (sections 1-17)</summary>
@@ -157,11 +163,13 @@ python3 docs/diagram_kv.py     # phase 2: writes docs/images/kv_*.png and prints
 │   ├── diagram_kv.py                  ← phase 2 concept images (kv_*.png)
 │   └── images/
 ├── infrastructure/
-│   └── template.yaml                  ← 2 DynamoDB tables, 2 Lambdas, REST API (AWS_IAM), client policy, N/W/R params
+│   └── template.yaml                  ← 2 DynamoDB tables, 2 Lambdas, REST API (AWS_IAM), client policy, N/W/R + MaxClockEntries params
 ├── src/
-│   ├── shared/ring_math.py            ← pure ring functions, copied into both functions by deploy.sh
+│   ├── shared/
+│   │   ├── ring_math.py               ← pure ring functions, copied into both functions by deploy.sh
+│   │   └── vector_clock.py            ← pure vector-clock ops (compare, merge, truncate, context), into kv
 │   ├── ring/handler.py                ← servers, routing, up/down API
-│   └── kv/handler.py                  ← quorum coordinator: PUT/GET /kv/{key}
+│   └── kv/handler.py                  ← quorum coordinator + vector clocks + LWW: PUT/GET /kv/{key}
 ├── tests/
 │   └── integration/
 │       ├── sigv4.py                   ← stack outputs + SigV4-signed calls
@@ -175,7 +183,7 @@ python3 docs/diagram_kv.py     # phase 2: writes docs/images/kv_*.png and prints
 ```bash
 cd 04-consistent-hashing
 ./scripts/deploy.sh dev us-east-1
-# optional: QUORUM_N=3 QUORUM_W=1 QUORUM_R=3 ./scripts/deploy.sh dev us-east-1
+# optional: QUORUM_N=3 QUORUM_W=1 QUORUM_R=3 MAX_CLOCK_ENTRIES=10 ./scripts/deploy.sh dev us-east-1
 # check packaging only (no AWS calls): BUILD_ONLY=1 ./scripts/deploy.sh   -> build/stage/src/{ring,kv}
 # attach the ClientPolicyArn output to your IAM user/role, then:
 python3 tests/integration/test_api.py dev
@@ -183,17 +191,19 @@ python3 tests/integration/test_api.py dev
 ```
 
 ## Cost & security notes
-- **Cost:** on-demand DynamoDB, Lambda and API Gateway are pay-per-request, so idle cost is ~$0. Adding a 100-vnode server is 100 writes. A KV write is 1 ring Query + up to N reads + N writes; a read is 1 Query + up to N reads.
+- **Cost:** on-demand DynamoDB, Lambda and API Gateway are pay-per-request, so idle cost is ~$0. Adding a 100-vnode server is 100 writes. A KV write is 1 ring Query + per replica a GetItem plus a conditional PutItem (a couple more on write contention, bounded by retry); a read is 1 Query + up to N reads.
 - **Auth:** every method uses `AWS_IAM`; callers need the `ClientPolicyArn` managed policy (`execute-api:Invoke` on this stage only). Unsigned requests get 403.
 - **Least privilege:** one role per function. The ring role allows only `Query`, `GetItem`, `PutItem`, `DeleteItem`, `UpdateItem` and `BatchWriteItem` on the ring table. The kv role allows only `Query` on the ring table and `GetItem`/`PutItem` on the data table. Each can write only to its own log group.
 - **Data:** both tables are encrypted at rest with point-in-time recovery on. Stage throttling is 10 rps, burst 20.
-- **Limits:** a prototype with a single writer in mind. Two concurrent add/remove calls can each report ranges computed from a stale ring, though the stored vnodes stay correct. Versions are a simple counter, so two concurrent writes to one key are last-writer-wins and can share a version number (vector clocks come later). A write can partly succeed: replicas that acked keep the value even when the response is 503. Removing a server does not move its data, and there is no delete endpoint for keys, so integration-test items stay in the data table until the stack is deleted.
+- **Limits:** a prototype. Two concurrent add/remove calls can each report ranges computed from a stale ring, though the stored vnodes stay correct. Each key now carries a vector clock, so concurrent writes become siblings instead of silently overwriting, but **server-side LWW conflict resolution can still silently drop a concurrent write**: it picks the version with the latest `timestamp`, so it relies on server clocks being close and loses the other value. Clock truncation at `MaxClockEntries` can make an ancestor look like a sibling, causing a false conflict (the known Dynamo trade-off). A write can partly succeed: replicas that acked keep the value even when the response is 503. Removing a server does not move its data, and there is no delete endpoint for keys, so integration-test items stay in the data table until the stack is deleted.
 
 ## What I learned / next steps
 - [x] Phase 1-2: concepts and key-value store design
 - [x] Step 1: hash ring with virtual nodes, routing API, preference list, affected ranges
 - [x] Step 2: quorum reads and writes (N, W, R) on replicas, simulated server failure, integer versions
-- [ ] Vector clocks and conflict resolution
+- [x] Step 3: vector clocks, conflict detection, server-side last-write-wins resolution, coordinator + opaque context
+- [ ] Read repair (write the resolved value back on read)
 - [ ] Sloppy quorum and hinted handoff for temporary failures
 - [ ] Merkle-tree anti-entropy repair
+- [ ] Gossip-based failure detection
 - [ ] Upgrade `01-key-value-store` with this design
