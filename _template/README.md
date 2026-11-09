@@ -32,6 +32,9 @@ flowchart LR
     Compute --> Store[(Storage)]
 ```
 
+<!-- steps:start -->
+<!-- steps:end -->
+
 ## How it works
 
 1. <!-- step -->

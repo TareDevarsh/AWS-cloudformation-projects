@@ -62,6 +62,16 @@ Long reference content (full API examples, schemas) goes in `<details><summary>â
 | Folder layout | `text` code block tree | Plain and copyable |
 | Navigation | Markdown links | Mermaid node links are unreliable on GitHub |
 
+### Step-by-step build (every project)
+
+Every project gets an animated, clickable "Build it step by step" section, modeled on [`01-key-value-store`](../01-key-value-store/README.md#build-it-step-by-step).
+
+- Source of truth: `docs/steps.yaml` (nodes with x/y + AWS icon, edges, steps with `caption` and `adds:` CloudFormation resources, and a `final` frame). `_template/docs/steps.yaml` is the skeleton.
+- Generate: `python3 scripts/build-steps.py <NN>-<slug>` (use the repo `.venv`; needs `pyyaml` and `diagrams`). It writes `docs/images/architecture-steps.svg` (CSS animation, plays in a GitHub README as an `<img>`) and the README block between `<!-- steps:start -->` and `<!-- steps:end -->` (the SVG plus a `<details>` + Mermaid diagram per step). `--check` reports stale output.
+- Keep in sync: change the architecture, then update `steps.yaml`, regenerate, and commit YAML, SVG, and README together. Put the IAM client policy in step 1.
+- Check frames in headless Chrome before committing (icons present, labels not on arrows, no text overflow).
+- GitHub READMEs can't run JS, iframes, or buttons, so animated SVG plus `<details>` is the most interactive option inside the README.
+
 Regenerate images after architecture changes: `pip install diagrams && brew install graphviz && python3 docs/diagram.py`.
 
 Not used: Mermaid `architecture-beta` (GitHub doesn't load icon packs, so icons show as `?`) and Mermaid `click` links (GitHub's sandbox blocks plain clicks).

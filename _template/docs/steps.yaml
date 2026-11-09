@@ -1,0 +1,42 @@
+# Step-by-step architecture for {{Title}}. Source of truth for:
+#   - docs/images/architecture-steps.svg  (animated, AWS icons)
+#   - the README "Build it step by step" section (<details> + Mermaid per step)
+# Regenerate (from repo root): python3 scripts/build-steps.py {{NN}}-{{slug}}
+# Reference example: 01-key-value-store/docs/steps.yaml
+#
+# Replace the placeholder nodes below with this project's real resources.
+# Every node/edge is drawn in every step; later ones are faded, so the layout never jumps.
+title: "{{NN}} · {{Title}}: built step by step"
+direction: LR
+
+# x/y: node center in the SVG (canvas 1000 wide, ~330 tall for the diagram area).
+# icon: path under the `diagrams` package resources/ folder (pip install diagrams).
+nodes:
+  - {id: Client,  label: "Client<br/>SigV4-signed HTTPS", step: 1, x: 100, y: 170, icon: aws/general/client.png}
+  - {id: Entry,   label: "API Gateway<br/>AWS_IAM auth", step: 1, x: 375, y: 170, icon: aws/network/api-gateway.png}
+  - {id: Compute, label: "Lambda<br/>function", step: 2, x: 635, y: 170, icon: aws/compute/lambda.png}
+  - {id: Store,   label: "DynamoDB<br/>table", shape: db, step: 3, x: 895, y: 170, icon: aws/database/dynamodb.png}
+
+edges:
+  - {from: Client,  to: Entry,   label: "execute-api:Invoke", step: 1}
+  - {from: Entry,   to: Compute, label: "AWS_PROXY", step: 2}
+  - {from: Compute, to: Store,   label: "read/write", step: 3}
+
+# adds: CloudFormation resources each step creates (copy from infrastructure/template.yaml).
+steps:
+  - label: Entry point
+    caption: One line on what this step adds and why.
+    adds:
+      - "AWS::ApiGateway::RestApi         Api"
+  - label: Compute
+    caption: One line on what this step adds and why.
+    adds:
+      - "AWS::Lambda::Function            Function"
+  - label: Storage
+    caption: One line on what this step adds and why.
+    adds:
+      - "AWS::DynamoDB::Table             Table"
+
+final:
+  label: "Done: N resources, one stack"
+  caption: "Everything above is one CloudFormation template: infrastructure/template.yaml"

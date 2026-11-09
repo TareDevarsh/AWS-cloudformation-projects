@@ -1,0 +1,55 @@
+# Step-by-step architecture. Source of truth for:
+#   - docs/images/architecture-steps.svg  (animated, AWS icons)
+#   - the README "Build it step by step" section (<details> + Mermaid per step)
+# Regenerate: python3 scripts/build-steps.py 01-key-value-store
+#
+# Every node and edge appears in every step so the layout never jumps.
+# Items from later steps are drawn faded (SVG) or grey (Mermaid).
+title: "01 · Key-Value Store: built step by step"
+direction: LR
+
+# x/y: node center in the SVG (canvas 1000 wide). icon: path under the
+# `diagrams` package resources/ folder (pip install diagrams).
+nodes:
+  - {id: Client, label: "Client<br/>SigV4-signed HTTPS", step: 1, x: 100, y: 170, icon: aws/general/client.png}
+  - {id: APIGW,  label: "API Gateway<br/>REST · AWS_IAM auth<br/>throttle 10 rps", step: 1, x: 375, y: 170, icon: aws/network/api-gateway.png}
+  - {id: Lambda, label: "Lambda<br/>kv-store-stage", step: 2, x: 635, y: 170, icon: aws/compute/lambda.png}
+  - {id: DDB,    label: "DynamoDB<br/>pk: key · TTL: expiresAt", shape: db, step: 3, x: 895, y: 100, icon: aws/database/dynamodb.png}
+  - {id: Logs,   label: "CloudWatch Logs<br/>14-day retention", step: 4, x: 895, y: 265, icon: aws/management/cloudwatch-logs.png}
+  - {id: IAM,    label: "IAM<br/>KvClientPolicy", step: 1, x: 100, y: 345, icon: aws/security/identity-and-access-management-iam.png}
+
+edges:
+  - {from: Client, to: APIGW,  label: "execute-api:Invoke", step: 1}
+  - {from: APIGW,  to: Lambda, label: "AWS_PROXY", step: 2}
+  - {from: Lambda, to: DDB,    label: "Get/Put/Delete/Scan", step: 3}
+  - {from: Lambda, to: Logs,   step: 4}
+  - {from: IAM,    to: Client, label: "grants", style: dotted, step: 1}
+
+# adds: CloudFormation resources this step creates (from infrastructure/kv-store.yaml).
+steps:
+  - label: API Gateway + IAM
+    caption: Client calls a REST API. Every method uses AWS_IAM; the client policy grants execute-api:Invoke, unsigned calls get 403.
+    adds:
+      - "AWS::IAM::ManagedPolicy          KvClientPolicy (attach to your user/role)"
+      - "AWS::ApiGateway::RestApi         KvApi"
+      - "AWS::ApiGateway::Resource ×2     /kv, /kv/{key}"
+      - "AWS::ApiGateway::Method ×4       list, GET, PUT, DELETE (AWS_IAM)"
+      - "AWS::ApiGateway::Deployment      + Stage, throttle 10 rps / burst 20"
+  - label: Lambda
+    caption: API Gateway proxies each request to one Python 3.12 Lambda that validates input.
+    adds:
+      - "AWS::Lambda::Function            KvFunction (Python 3.12)"
+      - "AWS::IAM::Role                   KvFunctionRole (least privilege)"
+      - "AWS::Lambda::Permission          lets this API invoke the function"
+  - label: DynamoDB
+    caption: Lambda reads and writes an on-demand table keyed by `key`, with TTL on `expiresAt`.
+    adds:
+      - "AWS::DynamoDB::Table             KvTable (on-demand, SSE, PITR, TTL)"
+  - label: CloudWatch Logs
+    caption: Lambda logs go to a dedicated log group with 14-day retention.
+    adds:
+      - "AWS::Logs::LogGroup              KvFunctionLogGroup (14 days)"
+
+final:
+  label: "Done: 15 resources, one stack"
+  caption: "Everything above is one CloudFormation template: infrastructure/kv-store.yaml"
