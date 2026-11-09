@@ -7,6 +7,8 @@
 # Items from later steps are drawn faded (SVG) or grey (Mermaid).
 title: "03 · Rate Limiter: built step by step"
 direction: LR
+# hero: the SVG is the README top image, so the steps section does not repeat it.
+hero: true
 
 nodes:
   - {id: Client,   label: "Client<br/>your laptop, owner IP only", step: 1, x: 85,  y: 200, icon: aws/general/client.png}

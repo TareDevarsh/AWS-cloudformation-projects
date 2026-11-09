@@ -225,12 +225,22 @@ def section(spec: dict) -> str:
         "",
         "### Build it step by step",
         "",
-        f"![{alt}](docs/images/{SVG_NAME})",
-        "",
-        "Each step shows what gets added and which CloudFormation resources it creates. "
-        "To go at your own pace, open a step below. 🟧 = added in this step, grey = comes later.",
-        "",
     ]
+    if spec.get("hero"):
+        # hero: true -> the SVG is already the README's top image; don't repeat it.
+        out += [
+            "The animation at the top builds the stack step by step. "
+            "To go at your own pace, open a step below. 🟧 = added in this step, grey = comes later.",
+            "",
+        ]
+    else:
+        out += [
+            f"![{alt}](docs/images/{SVG_NAME})",
+            "",
+            "Each step shows what gets added and which CloudFormation resources it creates. "
+            "To go at your own pace, open a step below. 🟧 = added in this step, grey = comes later.",
+            "",
+        ]
     for n, step in enumerate(steps, start=1):
         out += [
             "<details>",

@@ -7,7 +7,7 @@
 
 [← Portfolio](../README.md) · [Architecture](docs/architecture.md) · [Workflows](docs/workflow.md) · [Template](infrastructure/template.yaml) · [Code](src/)
 
-![Architecture](docs/images/architecture.png)
+![Animated architecture: the rate limiter stack built in 5 steps](docs/images/architecture-steps.svg)
 
 ## Summary
 
@@ -57,9 +57,7 @@ The leaky bucket adds SQS queues and one worker per language to this picture: se
 
 ### Build it step by step
 
-![Animated diagram: the stack built in 5 steps: Network + EC2 + nginx router, Limiters + rules, Redis, Backend Lambda, Leaky bucket extras (optional)](docs/images/architecture-steps.svg)
-
-Each step shows what gets added and which CloudFormation resources it creates. To go at your own pace, open a step below. 🟧 = added in this step, grey = comes later.
+The animation at the top builds the stack step by step. To go at your own pace, open a step below. 🟧 = added in this step, grey = comes later.
 
 <details>
 <summary><b>Step 1/5: Network + EC2 + nginx router</b></summary>
@@ -312,8 +310,9 @@ All values in ms. Not yet measured: the nginx router hop (from the router's `req
 │   ├── leaky_bucket/         ← README.md (queue, API, retries) + CODE_STRUCTURE.md (Merkle-tree file map)
 │   ├── sliding_window_log/   ← README.md + CODE_STRUCTURE.md
 │   ├── fixed_window_counter/ ← README.md + CODE_STRUCTURE.md
-│   ├── diagram.py            ← diagram-as-code (AWS icons)
-│   └── images/architecture.png
+│   ├── diagram.py            ← diagram-as-code (AWS icons) → images/architecture.png
+│   ├── steps.yaml            ← step-by-step source → images/architecture-steps.svg (top image)
+│   └── images/
 ├── infrastructure/
 │   └── template.yaml         ← CloudFormation stack
 ├── src/
@@ -389,6 +388,7 @@ Run from `03-rate-limiter`.
 | ✅ Leaky bucket code | `accept.lua`, `finish.lua`, limiter + worker in 3 languages, Compose, `Algorithm` parameter, queues + dead-letter queues, `deploy.sh` third argument |
 | ✅ Leaky bucket test script | `tests/integration/leaky_latency.py` (checked against a local stand-in only) |
 | ✅ Architecture image | `docs/diagram.py` → `docs/images/architecture.png`, both algorithms |
+| ✅ Step-by-step animation | `docs/steps.yaml` → `docs/images/architecture-steps.svg`, used as the top image here and in the portfolio gallery |
 | ✅ Sliding window log + fixed window counter | Lua scripts, limiters in 3 languages, Compose, `Algorithm` values, `deploy.sh` names, `window_latency.py` (checked against a local stand-in only) ([comparison](docs/architecture.md#algorithm-comparison)) |
 
 | Next | |

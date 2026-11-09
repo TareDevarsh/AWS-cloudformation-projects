@@ -25,7 +25,7 @@ Status legend: ⚪ Planned · 🟡 Prototype · 🟢 Deployed & tested
 <td width="50%" align="center"><a href="02-ad-creative-scorer/"><img src="02-ad-creative-scorer/docs/images/architecture.png" alt="02 Ad Creative Scorer architecture"/></a><br/><b><a href="02-ad-creative-scorer/">02 · Ad Creative Scorer</a></b></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="03-rate-limiter/"><img src="03-rate-limiter/docs/images/architecture.png" alt="03 Rate Limiter architecture"/></a><br/><b><a href="03-rate-limiter/">03 · Rate Limiter</a></b></td>
+<td width="50%" align="center"><a href="03-rate-limiter/"><img src="03-rate-limiter/docs/images/architecture-steps.svg" alt="03 Rate Limiter architecture, animated step by step"/></a><br/><b><a href="03-rate-limiter/">03 · Rate Limiter</a></b></td>
 <td width="50%" align="center"><a href="04-consistent-hashing/"><img src="04-consistent-hashing/docs/images/architecture.png" alt="04 Consistent Hashing architecture"/></a><br/><b><a href="04-consistent-hashing/">04 · Consistent Hashing</a></b></td>
 </tr>
 </table>

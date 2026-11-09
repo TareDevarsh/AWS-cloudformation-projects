@@ -68,6 +68,7 @@ Every project gets an animated, clickable "Build it step by step" section, model
 
 - Source of truth: `docs/steps.yaml` (nodes with x/y + AWS icon, edges, steps with `caption` and `adds:` CloudFormation resources, and a `final` frame). `_template/docs/steps.yaml` is the skeleton.
 - Generate: `python3 scripts/build-steps.py <NN>-<slug>` (use the repo `.venv`; needs `pyyaml` and `diagrams`). It writes `docs/images/architecture-steps.svg` (CSS animation, plays in a GitHub README as an `<img>`) and the README block between `<!-- steps:start -->` and `<!-- steps:end -->` (the SVG plus a `<details>` + Mermaid diagram per step). `--check` reports stale output.
+- Optional `hero: true` in `steps.yaml`: the animated SVG replaces `architecture.png` as the README top image (and in the root gallery), and the generated section skips repeating it.
 - Keep in sync: change the architecture, then update `steps.yaml`, regenerate, and commit YAML, SVG, and README together. Put the IAM client policy in step 1.
 - Check frames in headless Chrome before committing (icons present, labels not on arrows, no text overflow).
 - GitHub READMEs can't run JS, iframes, or buttons, so animated SVG plus `<details>` is the most interactive option inside the README.
