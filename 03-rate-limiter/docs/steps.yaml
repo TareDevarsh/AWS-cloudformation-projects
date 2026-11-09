@@ -1,0 +1,67 @@
+# Step-by-step architecture. Source of truth for:
+#   - docs/images/architecture-steps.svg  (animated, icons)
+#   - the README "Build it step by step" section (<details> + Mermaid per step)
+# Regenerate: python3 scripts/build-steps.py 03-rate-limiter
+#
+# Every node and edge appears in every step so the layout never jumps.
+# Items from later steps are drawn faded (SVG) or grey (Mermaid).
+title: "03 · Rate Limiter: built step by step"
+direction: LR
+
+nodes:
+  - {id: Client,   label: "Client<br/>your laptop, owner IP only", step: 1, x: 85,  y: 200, icon: aws/general/client.png}
+  - {id: Router,   label: "nginx router :8080<br/>EC2 t3.small · Compose", step: 1, x: 275, y: 200, icon: onprem/network/nginx.png}
+  - {id: Limiters, label: "Limiters ×3<br/>Python · Go · Node", step: 2, x: 490, y: 200, icon: onprem/container/docker.png}
+  - {id: Rules,    label: "S3<br/>rules.yaml", step: 2, x: 275, y: 350, icon: aws/storage/simple-storage-service-s3.png}
+  - {id: Redis,    label: "Redis<br/>counters · never published", shape: db, step: 3, x: 710, y: 100, icon: onprem/inmemory/redis.png}
+  - {id: Backend,  label: "Backend Lambda<br/>stand-in server", step: 4, x: 910, y: 200, icon: aws/compute/lambda.png}
+  - {id: Queues,   label: "SQS FIFO<br/>6 queues + 6 DLQs", step: 5, x: 490, y: 350, icon: aws/integration/simple-queue-service-sqs.png}
+  - {id: Workers,  label: "Workers ×3<br/>fixed rate", step: 5, x: 735, y: 350, icon: onprem/container/docker.png}
+
+edges:
+  - {from: Client,   to: Router,   label: "HTTP", step: 1}
+  - {from: Router,   to: Limiters, label: "by path", step: 2}
+  - {from: Rules,    to: Limiters, style: dotted, step: 2}
+  - {from: Limiters, to: Redis,    label: "atomic Lua", step: 3}
+  - {from: Limiters, to: Backend,  label: "allowed", step: 4}
+  - {from: Limiters, to: Queues,   label: "enqueue", step: 5}
+  - {from: Queues,   to: Workers,  label: "fixed rate", step: 5}
+  - {from: Workers,  to: Backend,  step: 5}
+
+# adds: what each step creates (from infrastructure/template.yaml; lines marked
+# "container" are Docker Compose services started on the instance, not AWS resources).
+steps:
+  - label: Network + EC2 + nginx router
+    caption: One EC2 runs Docker Compose. nginx is the only open port (your IP only) and routes by path.
+    adds:
+      - "VPC, IGW, Subnet, RouteTable, Route   7 networking resources"
+      - "AWS::EC2::SecurityGroup               InstanceSecurityGroup (no inbound rule)"
+      - "AWS::IAM::Role + InstanceProfile      InstanceRole (least privilege)"
+      - "AWS::EC2::LaunchTemplate + Instance   t3.small, Docker Compose"
+      - "container                             router (nginx, :8080)"
+  - label: Limiters + rules
+    caption: One limiter per language. Each finds who you are and applies rules kept in memory, re-read from S3.
+    adds:
+      - "container x3                          limiter-python, limiter-go, limiter-node"
+      - "S3 read access                        InstanceRole reads rules.yaml (bucket is a parameter)"
+  - label: Redis
+    caption: Each check is one atomic Lua call over all your counters in Redis. Redis is never published.
+    adds:
+      - "container                             redis (password, not published)"
+      - "Lua script                            token_bucket / sliding_window_log / fixed_window_counter"
+  - label: Backend Lambda
+    caption: Allowed requests reach the backend. Over the limit gets 429 + Retry-After and stops there.
+    adds:
+      - "AWS::IAM::Role                        BackendRole"
+      - "AWS::Logs::LogGroup                   BackendLogGroup (7 days)"
+      - "AWS::Lambda::Function                 BackendFunction"
+  - label: "Leaky bucket extras (optional)"
+    caption: "Leaky bucket only: accepted requests wait in SQS and workers drain them at a fixed rate."
+    adds:
+      - "AWS::SQS::Queue x6                    rate-limiter-stage-lang-tN.fifo (2 min retention)"
+      - "AWS::SQS::Queue x6                    matching dead-letter queues (after 5 tries)"
+      - "container x3                          worker-python, worker-go, worker-node"
+
+final:
+  label: "Done: 15 resources (27 with the leaky bucket), one stack"
+  caption: "Everything above is one CloudFormation template: infrastructure/template.yaml"
