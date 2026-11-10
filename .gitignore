@@ -48,3 +48,6 @@ node_modules/
 id_rsa*
 *.p12
 cdk.out/
+
+# Local agent rules (not published)
+.kiro/
